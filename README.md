@@ -7,7 +7,7 @@ After a terminal crash, a laptop reboot, or just losing track of where you were,
 working directories, last prompt, last activity — so you know exactly where to
 `claude --resume`.
 
-![screenshot](docs/screenshot.png)
+![reclaude screenshot](docs/screenshot.png)
 
 ## Why
 
