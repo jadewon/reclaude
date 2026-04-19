@@ -9,7 +9,9 @@ import html
 import json
 import os
 import pathlib
+import subprocess
 import time
+from urllib.parse import parse_qs, urlparse
 
 HOME = pathlib.Path.home()
 PROJECTS = HOME / ".claude" / "projects"
@@ -99,6 +101,45 @@ def gather_rows() -> list[dict]:
         rows.append(row)
     rows.sort(key=lambda r: r["mtime"], reverse=True)
     return rows
+
+
+def _search_sessions(query: str) -> list[str]:
+    """Find session_ids whose jsonl content contains the query (case-insensitive substring).
+
+    Tries ripgrep first; falls back to a pure-python scan if rg is missing.
+    """
+    if not query or not PROJECTS.exists():
+        return []
+    try:
+        result = subprocess.run(
+            ["rg", "-l", "-F", "-i", "-g", "*.jsonl", "--", query, str(PROJECTS)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except FileNotFoundError:
+        return _search_sessions_python(query)
+    except subprocess.TimeoutExpired:
+        return []
+    if result.returncode not in (0, 1):
+        return _search_sessions_python(query)
+    return [pathlib.Path(line).stem for line in result.stdout.splitlines() if line.endswith(".jsonl")]
+
+
+def _search_sessions_python(query: str) -> list[str]:
+    needle = query.lower().encode("utf-8")
+    out: list[str] = []
+    for p in PROJECTS.glob("*/*.jsonl"):
+        try:
+            with p.open("rb") as f:
+                for line in f:
+                    if needle in line.lower():
+                        out.append(p.stem)
+                        break
+        except OSError:
+            continue
+    return out
 
 
 def build_html() -> str:
@@ -599,7 +640,7 @@ def build_html() -> str:
   <div class="content">
     <div class="toolbar">
       <div class="search-wrap">
-        <input id="q" type="text" placeholder="search name, path, session id, prompt…" autofocus>
+        <input id="q" type="text" placeholder="search names, paths, ids, full content…" autofocus>
       </div>
       <button id="named-only" class="btn" type="button"><span class="check">□</span>named</button>
       <button id="group-cwd" class="btn" type="button"><span class="check">□</span>by dir</button>
@@ -636,6 +677,8 @@ def build_html() -> str:
 const ROWS = new Map();  // session_id -> row
 let DATA = [];
 let GENERATED_AT = "";
+let SEARCH_RESULT = null;  // null = no active search; Set<session_id> when active
+let SEARCH_REQ_ID = 0;
 
 function rebuildData() {{
   DATA = [...ROWS.values()].sort((a, b) => b.mtime - a.mtime);
@@ -857,7 +900,6 @@ function renderTree() {{
 }}
 
 function render() {{
-  const q = document.getElementById("q").value.trim().toLowerCase();
   const namedOnly = document.getElementById("named-only").classList.contains("active");
   const groupByCwd = document.getElementById("group-cwd").classList.contains("active");
   const groupByName = document.getElementById("group-name").classList.contains("active");
@@ -869,9 +911,8 @@ function render() {{
   const matches = DATA.filter(r => {{
     if (!matchesSelected(r)) return false;
     if (namedOnly && !r.custom_title) return false;
-    if (!q) return true;
-    const hay = [r.custom_title, r.cwd, r.session_id, r.last_prompt].filter(Boolean).join(" ").toLowerCase();
-    return hay.includes(q);
+    if (SEARCH_RESULT === null) return true;
+    return SEARCH_RESULT.has(r.session_id);
   }});
   document.getElementById("count-shown").textContent = matches.length;
   document.getElementById("count-total").textContent = DATA.length;
@@ -977,7 +1018,46 @@ setToggleBtn("named-only", "sessions-named-only");
   }});
 }})();
 
-document.getElementById("q").addEventListener("input", render);
+function localSearchIds(q) {{
+  const lo = q.toLowerCase();
+  const out = new Set();
+  for (const r of DATA) {{
+    const hay = [r.custom_title, r.cwd, r.session_id, r.last_prompt].filter(Boolean).join(" ").toLowerCase();
+    if (hay.includes(lo)) out.add(r.session_id);
+  }}
+  return out;
+}}
+
+async function updateSearch() {{
+  const q = document.getElementById("q").value.trim();
+  if (!q) {{
+    SEARCH_RESULT = null;
+    render();
+    return;
+  }}
+  const reqId = ++SEARCH_REQ_ID;
+  // immediate local matches across visible metadata
+  SEARCH_RESULT = localSearchIds(q);
+  render();
+  // augment with full-text matches from server (rg over jsonl bodies)
+  try {{
+    const res = await fetch("/search?q=" + encodeURIComponent(q));
+    if (reqId !== SEARCH_REQ_ID) return;  // a newer query has started; drop stale result
+    const d = await res.json();
+    const merged = new Set(SEARCH_RESULT);
+    for (const sid of (d.session_ids || [])) merged.add(sid);
+    SEARCH_RESULT = merged;
+    render();
+  }} catch (e) {{
+    // network error: keep local-only results
+  }}
+}}
+
+let _searchTimer;
+document.getElementById("q").addEventListener("input", () => {{
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(updateSearch, 200);
+}});
 
 document.getElementById("all-btn").addEventListener("click", () => {{
   SELECTED_PATH = "";
@@ -1180,8 +1260,17 @@ def serve(port: int) -> None:
                 self._send_bytes(template_bytes, "text/html; charset=utf-8")
             elif self.path == "/events":
                 self._stream_events()
+            elif self.path.startswith("/search"):
+                self._handle_search()
             else:
                 self.send_error(404)
+
+        def _handle_search(self) -> None:
+            qs = parse_qs(urlparse(self.path).query)
+            q = (qs.get("q") or [""])[0]
+            sids = _search_sessions(q)
+            body = json.dumps({"q": q, "session_ids": sids}, ensure_ascii=False).encode("utf-8")
+            self._send_bytes(body, "application/json; charset=utf-8")
 
         def _send_bytes(self, body: bytes, ctype: str) -> None:
             self.send_response(200)
