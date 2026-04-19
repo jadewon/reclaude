@@ -6,3 +6,7 @@ venv/
 .idea/
 .vscode/
 *.log
+
+# local-only Claude Code context, never publish
+CLAUDE.local.md
+.claude/
