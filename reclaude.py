@@ -11,6 +11,7 @@ import os
 import pathlib
 import re
 import time
+from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
 HOME = pathlib.Path.home()
@@ -202,12 +203,20 @@ def _make_snippet(raw_line: bytes, fallback_word: str, regex_pat, phrase_pat) ->
     if role == "user" and obj.get("isMeta"):
         role = "meta"
     full = text if len(text) <= _FULL_CAP else text[: _FULL_CAP] + "…"
+    ts_epoch: float | None = None
+    raw_ts = obj.get("timestamp")
+    if isinstance(raw_ts, str):
+        try:
+            ts_epoch = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            ts_epoch = None
     return {
         "role": role,
         "before": ("…" if pre > 0 else "") + text[pre:start],
         "match": text[start:end],
         "after": text[end:post] + ("…" if post < len(text) else ""),
         "full": full,
+        "ts": ts_epoch,
     }
 
 
@@ -1131,9 +1140,29 @@ function rowHtml(r, showCwd) {{
       <td><div class="cell-name"><span class="${{activeCls}}"></span>${{name}}</div></td>
       <td>${{cwdCell}}</td>
       <td>${{contextCell}}</td>
-      <td><span class="when" title="${{new Date(r.mtime*1000).toISOString()}}">${{fmtWhen(r.mtime)}}</span></td>
+      <td>${{renderLastCell(r)}}</td>
       <td><button class="copy" data-cmd="${{escapeHtml(cmd)}}">copy</button></td>
     </tr>`;
+}}
+
+function renderLastCell(r) {{
+  if (SEARCH_RESULT !== null) {{
+    const ts = latestMatchTs(r.session_id);
+    if (ts) {{
+      return `<span class="when" title="match @ ${{new Date(ts*1000).toISOString()}}">${{fmtWhen(ts)}}</span>`;
+    }}
+  }}
+  return `<span class="when" title="${{new Date(r.mtime*1000).toISOString()}}">${{fmtWhen(r.mtime)}}</span>`;
+}}
+
+function latestMatchTs(sid) {{
+  const snips = SEARCH_SNIPPETS[sid];
+  if (!snips || !snips.length) return null;
+  let max = 0;
+  for (const s of snips) {{
+    if (typeof s.ts === "number" && s.ts > max) max = s.ts;
+  }}
+  return max || null;
 }}
 
 function renderContextCell(r) {{
@@ -1259,7 +1288,9 @@ function render() {{
       const sa = SEARCH_SCORES[a.session_id] ?? 1;
       const sb = SEARCH_SCORES[b.session_id] ?? 1;
       if (sa !== sb) return sb - sa;
-      return b.mtime - a.mtime;
+      const ta = latestMatchTs(a.session_id) ?? a.mtime;
+      const tb = latestMatchTs(b.session_id) ?? b.mtime;
+      return tb - ta;
     }});
   }}
   document.getElementById("count-shown").textContent = matches.length;
