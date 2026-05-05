@@ -9,7 +9,7 @@ import html
 import json
 import os
 import pathlib
-import subprocess
+import re
 import time
 from urllib.parse import parse_qs, urlparse
 
@@ -103,43 +103,200 @@ def gather_rows() -> list[dict]:
     return rows
 
 
-def _search_sessions(query: str) -> list[str]:
-    """Find session_ids whose jsonl content contains the query (case-insensitive substring).
+_SNIPPET_BEFORE = 30
+_SNIPPET_AFTER = 110
+_FULL_CAP = 2000
+_MAX_SNIPPETS_PER_FILE = 3
+_WS_RUN = re.compile(r"\s+")
 
-    Tries ripgrep first; falls back to a pure-python scan if rg is missing.
+
+def _extract_text(obj: dict) -> str:
+    """Pull human-readable text out of a single jsonl line (one message)."""
+    parts: list[str] = []
+    msg = obj.get("message")
+    if isinstance(msg, dict):
+        c = msg.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            for block in c:
+                if not isinstance(block, dict):
+                    continue
+                t = block.get("type")
+                if t == "text":
+                    parts.append(block.get("text") or "")
+                elif t == "tool_use":
+                    inp = block.get("input")
+                    if inp is not None:
+                        try:
+                            parts.append(json.dumps(inp, ensure_ascii=False))
+                        except (TypeError, ValueError):
+                            pass
+                elif t == "tool_result":
+                    bc = block.get("content")
+                    if isinstance(bc, str):
+                        parts.append(bc)
+                    elif isinstance(bc, list):
+                        for sub in bc:
+                            if isinstance(sub, dict) and sub.get("type") == "text":
+                                parts.append(sub.get("text") or "")
+    if obj.get("type") == "summary" and isinstance(obj.get("summary"), str):
+        parts.append(obj["summary"])
+    if obj.get("type") == "custom-title" and isinstance(obj.get("customTitle"), str):
+        parts.append(obj["customTitle"])
+    if obj.get("type") == "attachment":
+        att = obj.get("attachment")
+        if isinstance(att, dict):
+            ac = att.get("content")
+            if isinstance(ac, str):
+                parts.append(ac)
+            elif isinstance(ac, list):
+                for sub in ac:
+                    if isinstance(sub, dict):
+                        for k in ("text", "content"):
+                            if isinstance(sub.get(k), str):
+                                parts.append(sub[k])
+    return "\n".join(p for p in parts if p)
+
+
+def _make_snippet(raw_line: bytes, fallback_word: str, regex_pat, phrase_pat) -> dict | None:
+    """Parse one jsonl line and return a snippet dict around the best hit.
+
+    Match-finding priority:
+      1. phrase_pat (multi-word query joined with optional [-_\\s]* separators)
+      2. regex_pat (when in regex mode)
+      3. fallback_word (a single literal word from word-AND mode)
+    """
+    try:
+        obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    text = _extract_text(obj)
+    if not text:
+        return None
+    text = _WS_RUN.sub(" ", text).strip()
+    if not text:
+        return None
+
+    start = end = -1
+    if phrase_pat is not None:
+        m = phrase_pat.search(text)
+        if m:
+            start, end = m.span()
+    if start < 0 and regex_pat is not None:
+        m = regex_pat.search(text)
+        if m:
+            start, end = m.span()
+    if start < 0 and fallback_word:
+        idx = text.lower().find(fallback_word.lower())
+        if idx >= 0:
+            start, end = idx, idx + len(fallback_word)
+    if start < 0:
+        return None
+
+    pre = max(0, start - _SNIPPET_BEFORE)
+    post = min(len(text), end + _SNIPPET_AFTER)
+    role = obj.get("type") or "?"
+    if role == "user" and obj.get("isMeta"):
+        role = "meta"
+    full = text if len(text) <= _FULL_CAP else text[: _FULL_CAP] + "…"
+    return {
+        "role": role,
+        "before": ("…" if pre > 0 else "") + text[pre:start],
+        "match": text[start:end],
+        "after": text[end:post] + ("…" if post < len(text) else ""),
+        "full": full,
+    }
+
+
+def _search_sessions(query: str, use_regex: bool = False) -> tuple[list[str], dict[str, list[dict]], dict[str, int]]:
+    """Search every jsonl for the query.
+
+    Word-AND mode (default): split query by whitespace; a session matches when
+    every word appears somewhere in the file. Snippets are taken from any line
+    where one of the words hit.
+
+    Regex mode: query is compiled as a single case-insensitive regex; a session
+    matches when at least one line matches.
     """
     if not query or not PROJECTS.exists():
-        return []
-    try:
-        result = subprocess.run(
-            ["rg", "-l", "-F", "-i", "-g", "*.jsonl", "--", query, str(PROJECTS)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except FileNotFoundError:
-        return _search_sessions_python(query)
-    except subprocess.TimeoutExpired:
-        return []
-    if result.returncode not in (0, 1):
-        return _search_sessions_python(query)
-    return [pathlib.Path(line).stem for line in result.stdout.splitlines() if line.endswith(".jsonl")]
-
-
-def _search_sessions_python(query: str) -> list[str]:
-    needle = query.lower().encode("utf-8")
-    out: list[str] = []
-    for p in PROJECTS.glob("*/*.jsonl"):
+        return [], {}, {}
+    pat = None
+    pat_bytes = None
+    phrase_pat = None
+    phrase_pat_bytes = None
+    word_strs: list[str] = []
+    if use_regex:
         try:
-            with p.open("rb") as f:
-                for line in f:
-                    if needle in line.lower():
-                        out.append(p.stem)
-                        break
+            pat = re.compile(query, re.IGNORECASE)
+            pat_bytes = re.compile(query.encode("utf-8"), re.IGNORECASE)
+        except re.error:
+            return [], {}, {}
+    else:
+        word_strs = [w for w in query.lower().split() if w]
+        if not word_strs:
+            return [], {}, {}
+        if len(word_strs) >= 2:
+            joined = r"[\-_\s]*".join(re.escape(w) for w in word_strs)
+            phrase_pat = re.compile(joined, re.IGNORECASE)
+            phrase_pat_bytes = re.compile(joined.encode("utf-8"), re.IGNORECASE)
+
+    words_bytes = [w.encode("utf-8") for w in word_strs]
+
+    sids: list[str] = []
+    snippets: dict[str, list[dict]] = {}
+    scores: dict[str, int] = {}
+
+    for path in PROJECTS.glob("*/*.jsonl"):
+        try:
+            with path.open("rb") as f:
+                phrase_snips: list[dict] = []
+                word_snips: list[dict] = []
+                found: set[bytes] = set()
+                phrase_hit = False
+                for raw_line in f:
+                    line_lower = raw_line.lower()
+                    fallback: str | None = None
+                    line_matches = False
+                    is_phrase_line = False
+                    if pat_bytes is not None:
+                        if pat_bytes.search(raw_line):
+                            line_matches = True
+                            found.add(b"__regex__")
+                    else:
+                        for w_bytes, w_str in zip(words_bytes, word_strs):
+                            if w_bytes in line_lower:
+                                if w_bytes not in found:
+                                    found.add(w_bytes)
+                                if fallback is None:
+                                    fallback = w_str
+                                line_matches = True
+                        if phrase_pat_bytes is not None and phrase_pat_bytes.search(line_lower):
+                            is_phrase_line = True
+                            phrase_hit = True
+                    if is_phrase_line and len(phrase_snips) < _MAX_SNIPPETS_PER_FILE:
+                        snip = _make_snippet(raw_line, fallback or "", pat, phrase_pat)
+                        if snip is not None:
+                            phrase_snips.append(snip)
+                    elif line_matches and not is_phrase_line and len(word_snips) < _MAX_SNIPPETS_PER_FILE:
+                        snip = _make_snippet(raw_line, fallback or "", pat, phrase_pat)
+                        if snip is not None:
+                            word_snips.append(snip)
         except OSError:
             continue
-    return out
+        if pat_bytes is not None:
+            qualifies = b"__regex__" in found
+        else:
+            qualifies = len(found) == len(words_bytes)
+        if qualifies:
+            sids.append(path.stem)
+            file_snips = (phrase_snips + word_snips)[:_MAX_SNIPPETS_PER_FILE]
+            if file_snips:
+                snippets[path.stem] = file_snips
+            scores[path.stem] = 2 if phrase_hit else 1
+    return sids, snippets, scores
 
 
 def build_html() -> str:
@@ -411,6 +568,21 @@ def build_html() -> str:
     border-color: var(--accent);
     background: var(--surface-hi);
   }}
+  .search-spinner {{
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    width: 12px;
+    height: 12px;
+    margin-top: -6px;
+    border: 1.5px solid var(--muted-soft);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    display: none;
+  }}
+  body.searching .search-spinner {{ display: block; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
   .btn {{
     background: transparent;
     border: 1px solid var(--border);
@@ -539,6 +711,121 @@ def build_html() -> str:
     overflow: hidden;
   }}
 
+  .snippets {{ display: flex; flex-direction: column; gap: 4px; cursor: pointer; }}
+  .snippets:hover {{ background: var(--row-hover); }}
+  .snippet {{
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--fg-dim);
+  }}
+  .snippet-role {{
+    flex: 0 0 auto;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    padding: 1px 5px;
+    border-radius: 2px;
+  }}
+  .snippet-text {{
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  .snippet mark, .modal-body mark {{
+    background: var(--accent-soft);
+    color: var(--accent);
+    padding: 0 2px;
+    font-weight: 600;
+    border-radius: 2px;
+  }}
+
+  .modal-backdrop {{
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    padding: 40px;
+  }}
+  .modal {{
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    width: min(900px, 100%);
+    max-height: 100%;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+  }}
+  .modal-head {{
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 16px 22px;
+    border-bottom: 1px solid var(--border);
+  }}
+  .modal-title {{
+    flex: 1;
+    font-family: "Fraunces", serif;
+    font-style: italic;
+    font-size: 22px;
+    color: var(--fg);
+  }}
+  .modal-close {{
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    font-size: 18px;
+    width: 32px;
+    height: 32px;
+    cursor: pointer;
+    line-height: 1;
+  }}
+  .modal-close:hover {{ color: var(--accent); border-color: var(--accent); }}
+  .modal-meta {{
+    padding: 10px 22px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--muted);
+    font-family: "JetBrains Mono", monospace;
+  }}
+  .modal-meta .sep {{ margin: 0 10px; color: var(--muted-soft); }}
+  .modal-body {{
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 22px 22px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }}
+  .modal-msg {{
+    border-left: 2px solid var(--border-strong);
+    padding: 6px 12px;
+  }}
+  .modal-msg.has-hit {{ border-left-color: var(--accent); }}
+  .modal-msg-role {{
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }}
+  .modal-msg.has-hit .modal-msg-role {{ color: var(--accent); }}
+  .modal-msg-text {{
+    font-size: 12.5px;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--fg-dim);
+  }}
+
   .when {{
     color: var(--muted);
     font-size: 11px;
@@ -611,6 +898,23 @@ def build_html() -> str:
     margin-bottom: 12px;
     font-style: italic;
   }}
+  .empty-search {{
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+  }}
+  .empty-spinner {{
+    width: 14px;
+    height: 14px;
+    border: 1.5px solid var(--muted-soft);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }}
+  body.searching .empty .empty-text {{ display: none; }}
+  body.searching .empty .empty-search {{ display: inline-flex; }}
+  body.searching .empty::before {{ content: "" ; }}
 
   /* scrollbar */
   ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
@@ -641,7 +945,9 @@ def build_html() -> str:
     <div class="toolbar">
       <div class="search-wrap">
         <input id="q" type="text" placeholder="search names, paths, ids, full content…" autofocus>
+        <span id="search-spinner" class="search-spinner" aria-hidden="true"></span>
       </div>
+      <button id="regex-mode" class="btn" type="button" title="treat query as regex"><span class="check">□</span>regex</button>
       <button id="named-only" class="btn" type="button"><span class="check">□</span>named</button>
       <button id="group-cwd" class="btn" type="button"><span class="check">□</span>by dir</button>
       <button id="group-name" class="btn" type="button"><span class="check">□</span>by name</button>
@@ -662,23 +968,41 @@ def build_html() -> str:
           <tr>
             <th>name</th>
             <th>directory</th>
-            <th>last prompt</th>
+            <th id="col-context">last prompt</th>
             <th>last</th>
             <th>resume</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
       </table>
-      <div class="empty" id="empty" style="display:none">no sessions match your filters</div>
+      <div class="empty" id="empty" style="display:none">
+        <span class="empty-text">no sessions match your filters</span>
+        <span class="empty-search"><span class="empty-spinner" aria-hidden="true"></span>searching all sessions…</span>
+      </div>
     </main>
   </div>
 </div>
+
+<div id="modal-backdrop" class="modal-backdrop" style="display:none">
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <div class="modal-title" id="modal-title"></div>
+      <button class="modal-close" id="modal-close" type="button" aria-label="close">×</button>
+    </div>
+    <div class="modal-meta" id="modal-meta"></div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
 <script>
 const ROWS = new Map();  // session_id -> row
 let DATA = [];
 let GENERATED_AT = "";
 let SEARCH_RESULT = null;  // null = no active search; Set<session_id> when active
+let SEARCH_SNIPPETS = {{}};  // session_id -> snippet array (role, before, match, after)
+let SEARCH_SCORES = {{}};    // session_id -> int (2 = phrase hit, 1 = word matches)
 let SEARCH_REQ_ID = 0;
+let SEARCH_REGEX_MODE = localStorage.getItem("sessions-regex") === "1";
 
 function rebuildData() {{
   DATA = [...ROWS.values()].sort((a, b) => b.mtime - a.mtime);
@@ -797,7 +1121,7 @@ function rowHtml(r, showCwd) {{
   const cwdCell = showCwd
     ? `<div class="cwd-path" title="${{escapeHtml(cwdPretty)}}">${{renderCwdPath(r.cwd)}}</div><div class="sid">${{shortId(r.session_id)}}</div>`
     : `<div class="sid">${{shortId(r.session_id)}}</div>`;
-  const prompt = r.last_prompt ? escapeHtml(r.last_prompt) : "";
+  const contextCell = renderContextCell(r);
   const resumeArg = r.custom_title ? `"${{r.custom_title}}"` : r.session_id;
   const cmd = r.cwd
     ? `cd "${{r.cwd}}" && claude --resume ${{resumeArg}}`
@@ -806,10 +1130,26 @@ function rowHtml(r, showCwd) {{
     <tr>
       <td><div class="cell-name"><span class="${{activeCls}}"></span>${{name}}</div></td>
       <td>${{cwdCell}}</td>
-      <td><div class="prompt" title="${{escapeHtml(r.last_prompt || "")}}">${{prompt}}</div></td>
+      <td>${{contextCell}}</td>
       <td><span class="when" title="${{new Date(r.mtime*1000).toISOString()}}">${{fmtWhen(r.mtime)}}</span></td>
       <td><button class="copy" data-cmd="${{escapeHtml(cmd)}}">copy</button></td>
     </tr>`;
+}}
+
+function renderContextCell(r) {{
+  const snips = SEARCH_SNIPPETS[r.session_id];
+  if (snips && snips.length) {{
+    const items = snips.map(s => {{
+      const role = escapeHtml(s.role || "?");
+      const before = escapeHtml(s.before || "");
+      const match = escapeHtml(s.match || "");
+      const after = escapeHtml(s.after || "");
+      return `<div class="snippet"><span class="snippet-role">${{role}}</span><span class="snippet-text">${{before}}<mark>${{match}}</mark>${{after}}</span></div>`;
+    }}).join("");
+    return `<div class="snippets" data-sid="${{escapeHtml(r.session_id)}}" title="click to view full context">${{items}}</div>`;
+  }}
+  const prompt = r.last_prompt ? escapeHtml(r.last_prompt) : "";
+  return `<div class="prompt" title="${{escapeHtml(r.last_prompt || "")}}">${{prompt}}</div>`;
 }}
 
 const COLLAPSED = new Set();
@@ -914,6 +1254,14 @@ function render() {{
     if (SEARCH_RESULT === null) return true;
     return SEARCH_RESULT.has(r.session_id);
   }});
+  if (SEARCH_RESULT !== null) {{
+    matches.sort((a, b) => {{
+      const sa = SEARCH_SCORES[a.session_id] ?? 1;
+      const sb = SEARCH_SCORES[b.session_id] ?? 1;
+      if (sa !== sb) return sb - sa;
+      return b.mtime - a.mtime;
+    }});
+  }}
   document.getElementById("count-shown").textContent = matches.length;
   document.getElementById("count-total").textContent = DATA.length;
   if (matches.length === 0) {{ tbody.innerHTML = ""; empty.style.display = "block"; return; }}
@@ -973,7 +1321,82 @@ function render() {{
       render();
     }});
   }});
+  tbody.querySelectorAll(".snippets").forEach(cell => {{
+    cell.addEventListener("click", (e) => {{
+      e.stopPropagation();
+      openSnippetModal(cell.dataset.sid);
+    }});
+  }});
 }}
+
+function buildHighlightRegex() {{
+  const q = document.getElementById("q").value.trim();
+  if (!q) return null;
+  if (SEARCH_REGEX_MODE) {{
+    try {{ return new RegExp(q, "gi"); }} catch (e) {{ return null; }}
+  }}
+  const words = q.split(/\\s+/).filter(Boolean);
+  if (!words.length) return null;
+  const esc = s => s.replace(/[.*+?^${{}}()|[\\]\\\\]/g, "\\\\$&");
+  // longest words first so phrase patterns win over individual words
+  const sortedWords = [...words].sort((a, b) => b.length - a.length);
+  const phrase = words.map(esc).join("[\\\\-_\\\\s]*");
+  const parts = [phrase, ...sortedWords.map(esc)];
+  return new RegExp("(" + parts.join("|") + ")", "gi");
+}}
+
+function highlightText(text, re) {{
+  if (!re) return escapeHtml(text);
+  let out = "";
+  let last = 0;
+  re.lastIndex = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {{
+    if (m.index === re.lastIndex) {{ re.lastIndex++; continue; }}
+    out += escapeHtml(text.slice(last, m.index));
+    out += "<mark>" + escapeHtml(m[0]) + "</mark>";
+    last = m.index + m[0].length;
+  }}
+  out += escapeHtml(text.slice(last));
+  return out;
+}}
+
+function openSnippetModal(sid) {{
+  const row = ROWS.get(sid);
+  const snips = SEARCH_SNIPPETS[sid] || [];
+  if (!row) return;
+  const re = buildHighlightRegex();
+  const title = row.custom_title || "(unnamed)";
+  document.getElementById("modal-title").textContent = title;
+  const cwd = row.cwd ? prettyPath(row.cwd) : "(unknown)";
+  document.getElementById("modal-meta").innerHTML =
+    `<span>${{escapeHtml(cwd)}}</span><span class="sep">·</span><span>${{escapeHtml(shortId(sid))}}</span><span class="sep">·</span><span>${{snips.length}} match block${{snips.length === 1 ? "" : "s"}}</span>`;
+  const body = document.getElementById("modal-body");
+  if (!snips.length) {{
+    body.innerHTML = `<div class="modal-msg"><div class="modal-msg-text">${{escapeHtml(row.last_prompt || "(no preview available)")}}</div></div>`;
+  }} else {{
+    body.innerHTML = snips.map(s => {{
+      const role = escapeHtml(s.role || "?");
+      const text = s.full || ((s.before || "") + (s.match || "") + (s.after || ""));
+      return `<div class="modal-msg has-hit"><div class="modal-msg-role">${{role}}</div><div class="modal-msg-text">${{highlightText(text, re)}}</div></div>`;
+    }}).join("");
+  }}
+  document.getElementById("modal-backdrop").style.display = "flex";
+}}
+
+function closeSnippetModal() {{
+  document.getElementById("modal-backdrop").style.display = "none";
+}}
+
+document.getElementById("modal-close").addEventListener("click", closeSnippetModal);
+document.getElementById("modal-backdrop").addEventListener("click", (e) => {{
+  if (e.target.id === "modal-backdrop") closeSnippetModal();
+}});
+document.addEventListener("keydown", (e) => {{
+  if (e.key === "Escape" && document.getElementById("modal-backdrop").style.display !== "none") {{
+    closeSnippetModal();
+  }}
+}});
 
 function setToggleBtn(id, storageKey) {{
   const btn = document.getElementById(id);
@@ -1018,12 +1441,28 @@ setToggleBtn("named-only", "sessions-named-only");
   }});
 }})();
 
+function syncContextHeader() {{
+  const el = document.getElementById("col-context");
+  if (!el) return;
+  el.textContent = SEARCH_RESULT === null ? "last prompt" : "matches";
+}}
+
 function localSearchIds(q) {{
-  const lo = q.toLowerCase();
   const out = new Set();
+  if (SEARCH_REGEX_MODE) {{
+    let re;
+    try {{ re = new RegExp(q, "i"); }} catch (e) {{ return out; }}
+    for (const r of DATA) {{
+      const hay = [r.custom_title, r.cwd, r.session_id, r.last_prompt].filter(Boolean).join(" ");
+      if (re.test(hay)) out.add(r.session_id);
+    }}
+    return out;
+  }}
+  const words = q.toLowerCase().split(/\\s+/).filter(Boolean);
+  if (!words.length) return out;
   for (const r of DATA) {{
     const hay = [r.custom_title, r.cwd, r.session_id, r.last_prompt].filter(Boolean).join(" ").toLowerCase();
-    if (hay.includes(lo)) out.add(r.session_id);
+    if (words.every(w => hay.includes(w))) out.add(r.session_id);
   }}
   return out;
 }}
@@ -1032,24 +1471,35 @@ async function updateSearch() {{
   const q = document.getElementById("q").value.trim();
   if (!q) {{
     SEARCH_RESULT = null;
+    SEARCH_SNIPPETS = {{}};
+    SEARCH_SCORES = {{}};
+    document.body.classList.remove("searching");
+    syncContextHeader();
     render();
     return;
   }}
   const reqId = ++SEARCH_REQ_ID;
-  // immediate local matches across visible metadata
   SEARCH_RESULT = localSearchIds(q);
+  SEARCH_SNIPPETS = {{}};
+  SEARCH_SCORES = {{}};
+  syncContextHeader();
   render();
-  // augment with full-text matches from server (rg over jsonl bodies)
+  document.body.classList.add("searching");
   try {{
-    const res = await fetch("/search?q=" + encodeURIComponent(q));
-    if (reqId !== SEARCH_REQ_ID) return;  // a newer query has started; drop stale result
+    const url = "/search?q=" + encodeURIComponent(q) + (SEARCH_REGEX_MODE ? "&regex=1" : "");
+    const res = await fetch(url);
+    if (reqId !== SEARCH_REQ_ID) return;
     const d = await res.json();
     const merged = new Set(SEARCH_RESULT);
     for (const sid of (d.session_ids || [])) merged.add(sid);
     SEARCH_RESULT = merged;
+    SEARCH_SNIPPETS = d.snippets || {{}};
+    SEARCH_SCORES = d.scores || {{}};
     render();
   }} catch (e) {{
-    // network error: keep local-only results
+    // network error: keep local-only results, no snippets
+  }} finally {{
+    if (reqId === SEARCH_REQ_ID) document.body.classList.remove("searching");
   }}
 }}
 
@@ -1058,6 +1508,22 @@ document.getElementById("q").addEventListener("input", () => {{
   clearTimeout(_searchTimer);
   _searchTimer = setTimeout(updateSearch, 200);
 }});
+
+(function initRegexBtn() {{
+  const btn = document.getElementById("regex-mode");
+  const check = btn.querySelector(".check");
+  function sync() {{
+    btn.classList.toggle("active", SEARCH_REGEX_MODE);
+    if (check) check.textContent = SEARCH_REGEX_MODE ? "■" : "□";
+  }}
+  sync();
+  btn.addEventListener("click", () => {{
+    SEARCH_REGEX_MODE = !SEARCH_REGEX_MODE;
+    localStorage.setItem("sessions-regex", SEARCH_REGEX_MODE ? "1" : "0");
+    sync();
+    if (document.getElementById("q").value.trim()) updateSearch();
+  }});
+}})();
 
 document.getElementById("all-btn").addEventListener("click", () => {{
   SELECTED_PATH = "";
@@ -1268,8 +1734,12 @@ def serve(port: int) -> None:
         def _handle_search(self) -> None:
             qs = parse_qs(urlparse(self.path).query)
             q = (qs.get("q") or [""])[0]
-            sids = _search_sessions(q)
-            body = json.dumps({"q": q, "session_ids": sids}, ensure_ascii=False).encode("utf-8")
+            use_regex = (qs.get("regex") or ["0"])[0] in ("1", "true", "yes")
+            sids, snippets, scores = _search_sessions(q, use_regex=use_regex)
+            body = json.dumps(
+                {"q": q, "regex": use_regex, "session_ids": sids, "snippets": snippets, "scores": scores},
+                ensure_ascii=False,
+            ).encode("utf-8")
             self._send_bytes(body, "application/json; charset=utf-8")
 
         def _send_bytes(self, body: bytes, ctype: str) -> None:

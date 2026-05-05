@@ -54,7 +54,7 @@ No REST endpoints, no polling from the browser. One long-lived stream per tab.
 ## UI
 
 - Left sidebar: directory tree (filters to that subtree on click)
-- Toolbar: full-text search (`/`) across session bodies via ripgrep, `named` filter, `by dir` / `by name` grouping
+- Toolbar: full-text search (`/`) across session bodies with word-AND fuzzy + `regex` toggle; matches preview the surrounding context with the hit highlighted, `named` filter, `by dir` / `by name` grouping
 - Dark + light themes (auto by OS, manual toggle persists)
 - Each row: `copy` button writes `cd "<cwd>" && claude --resume <name|id>`
   to clipboard
