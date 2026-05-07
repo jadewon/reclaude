@@ -10,6 +10,8 @@ import json
 import os
 import pathlib
 import re
+import sqlite3
+import threading
 import time
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse
@@ -220,6 +222,210 @@ def _make_snippet(raw_line: bytes, fallback_word: str, regex_pat, phrase_pat) ->
     }
 
 
+# ───── search index (SQLite, on-disk bigram inverted index) ───────────────────
+# Idle background indexer + per-thread reader connections. See
+# docs/plans/v1-bigram-index.md for the rationale (bigrams handle Korean as
+# well as English; FTS5 trigram is rejected for CJK quality and build-flag
+# fragility).
+
+def _index_db_path() -> pathlib.Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(HOME / ".cache")
+    return pathlib.Path(base) / "reclaude" / "index.db"
+
+
+_index_local = threading.local()
+
+
+def _index_conn() -> sqlite3.Connection:
+    conn = getattr(_index_local, "conn", None)
+    if conn is not None:
+        return conn
+    p = _index_db_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(p), isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS files ("
+        " path TEXT PRIMARY KEY, mtime REAL NOT NULL, size INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS postings ("
+        " gram TEXT NOT NULL, path TEXT NOT NULL,"
+        " PRIMARY KEY (gram, path)) WITHOUT ROWID"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_postings_path ON postings(path)")
+    _index_local.conn = conn
+    return conn
+
+
+def _bigrams_of(word: str) -> set[str]:
+    if len(word) < 2:
+        return set()
+    return {word[i:i + 2] for i in range(len(word) - 1)}
+
+
+def _extract_file_bigrams(text: str) -> set[str]:
+    """Lowercase + bigrams from every non-whitespace run."""
+    grams: set[str] = set()
+    for run in text.lower().split():
+        if len(run) < 2:
+            continue
+        for i in range(len(run) - 1):
+            grams.add(run[i:i + 2])
+    return grams
+
+
+def _index_file(path: pathlib.Path, mtime: float, size: int) -> bool:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return False
+    grams = _extract_file_bigrams(text)
+    path_str = str(path)
+    conn = _index_conn()
+    try:
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM postings WHERE path = ?", (path_str,))
+        if grams:
+            conn.executemany(
+                "INSERT OR IGNORE INTO postings(gram, path) VALUES (?, ?)",
+                [(g, path_str) for g in grams],
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO files(path, mtime, size) VALUES (?, ?, ?)",
+            (path_str, mtime, size),
+        )
+        conn.execute("COMMIT")
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        return False
+    return True
+
+
+def _index_purge(path_str: str) -> None:
+    conn = _index_conn()
+    try:
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM postings WHERE path = ?", (path_str,))
+        conn.execute("DELETE FROM files WHERE path = ?", (path_str,))
+        conn.execute("COMMIT")
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
+
+def _index_pick_pending() -> tuple[pathlib.Path, float, int] | None:
+    """Find one jsonl file that is missing from the index or stale.
+
+    Also opportunistically purges entries for files that no longer exist on
+    disk; returns None when there's nothing left to do.
+    """
+    conn = _index_conn()
+    indexed = {r[0]: (r[1], r[2]) for r in conn.execute(
+        "SELECT path, mtime, size FROM files"
+    )}
+    seen: set[str] = set()
+    pending: tuple[pathlib.Path, float, int] | None = None
+    if PROJECTS.exists():
+        for p in PROJECTS.glob("*/*.jsonl"):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            ps = str(p)
+            seen.add(ps)
+            prev = indexed.get(ps)
+            if prev is None or prev[0] != st.st_mtime or prev[1] != st.st_size:
+                if pending is None:
+                    pending = (p, st.st_mtime, st.st_size)
+    if pending is not None:
+        return pending
+    for ps in indexed:
+        if ps not in seen:
+            _index_purge(ps)
+            return None  # one unit of work per cycle
+    return None
+
+
+def _index_lookup(query: str) -> set[str] | None:
+    """Return candidate jsonl paths for `query`, or None if index can't filter.
+
+    The candidate set is:
+
+        (files whose postings match every word's bigrams)
+        ∪ (files on disk that are missing from the index or stale)
+
+    The second term is what makes search correct *while* the index is still
+    being built or while a recently-modified file hasn't been re-indexed yet:
+    those files are always handed to the verification scan rather than being
+    silently excluded. As more files become fresh in the index, the "unknown"
+    term shrinks and the speedup grows.
+
+    Returns None when no word in the query produced any usable bigram (e.g.
+    every word is a single codepoint), so callers fall back to a full scan.
+    """
+    if not query:
+        return None
+    words = [w for w in query.lower().split() if w]
+    if not words:
+        return None
+    conn = _index_conn()
+    matched: set[str] | None = None
+    used_index = False
+    for w in words:
+        grams = _bigrams_of(w)
+        if not grams:
+            continue
+        word_paths: set[str] | None = None
+        for g in grams:
+            cur = conn.execute("SELECT path FROM postings WHERE gram = ?", (g,))
+            paths = {r[0] for r in cur}
+            if word_paths is None:
+                word_paths = paths
+            else:
+                word_paths &= paths
+            if not word_paths:
+                break
+        if word_paths is None:
+            continue
+        used_index = True
+        if matched is None:
+            matched = word_paths
+        else:
+            matched &= word_paths
+    if not used_index:
+        return None
+    if matched is None:
+        matched = set()
+
+    # Files whose freshness the index can't yet vouch for must be verified
+    # by the line scanner — silently skipping them would produce false
+    # negatives during initial build and during the small window after a
+    # file changes but before the watcher re-indexes it.
+    indexed = {r[0]: (r[1], r[2]) for r in conn.execute(
+        "SELECT path, mtime, size FROM files"
+    )}
+    unknown: set[str] = set()
+    if PROJECTS.exists():
+        for p in PROJECTS.glob("*/*.jsonl"):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            ps = str(p)
+            prev = indexed.get(ps)
+            if prev is None or prev[0] != st.st_mtime or prev[1] != st.st_size:
+                unknown.add(ps)
+    return matched | unknown
+
+
 def _search_sessions(query: str, use_regex: bool = False) -> tuple[list[str], dict[str, list[dict]], dict[str, int]]:
     """Search every jsonl for the query.
 
@@ -258,7 +464,20 @@ def _search_sessions(query: str, use_regex: bool = False) -> tuple[list[str], di
     snippets: dict[str, list[dict]] = {}
     scores: dict[str, int] = {}
 
-    for path in PROJECTS.glob("*/*.jsonl"):
+    candidate_paths: list[pathlib.Path]
+    if use_regex:
+        candidate_paths = list(PROJECTS.glob("*/*.jsonl"))
+    else:
+        try:
+            cand = _index_lookup(query)
+        except sqlite3.Error:
+            cand = None
+        if cand is None:
+            candidate_paths = list(PROJECTS.glob("*/*.jsonl"))
+        else:
+            candidate_paths = [pathlib.Path(p) for p in cand]
+
+    for path in candidate_paths:
         try:
             with path.open("rb") as f:
                 phrase_snips: list[dict] = []
@@ -1603,6 +1822,21 @@ document.addEventListener("keydown", (e) => {{
   }}
 }});
 
+// Idle detection — the server only runs background indexing when no tab is
+// visible+focused. We POST on every transition (visibilitychange / focus /
+// blur), plus once on load to set the initial state.
+function reportVisibility() {{
+  const active = (document.visibilityState === "visible") && document.hasFocus();
+  try {{
+    fetch("/visibility?state=" + (active ? "active" : "inactive"),
+          {{ method: "POST", keepalive: true }}).catch(() => {{}});
+  }} catch (_) {{}}
+}}
+document.addEventListener("visibilitychange", reportVisibility);
+window.addEventListener("focus", reportVisibility);
+window.addEventListener("blur", reportVisibility);
+reportVisibility();
+
 subscribeEvents();
 </script>
 </body>
@@ -1613,13 +1847,40 @@ subscribeEvents();
 
 # ───── server state ───────────────────────────────────────────────────────────
 import queue
-import threading
 
 _state_lock = threading.RLock()
 _rows_by_id: dict[str, dict] = {}           # session_id -> row
 _file_mtime: dict[str, float] = {}          # jsonl path -> mtime (last scanned)
 _file_to_session: dict[str, str] = {}       # jsonl path -> session_id
 _subscribers: list["queue.Queue[dict]"] = []
+
+# Idle detection. The frontend POSTs /visibility on visibilitychange / focus
+# / blur with state=active|inactive (active iff visible AND focused). The
+# watcher only runs the index builder while no tab is active, so background
+# indexing never competes with foreground browsing.
+#
+# Last-write-wins on a single bool: with two reclaude tabs in different
+# windows, the most recently-fired event determines the state, which can
+# briefly be wrong (active tab still up but inactive tab's blur arrived
+# last). We accept this — the next visibilitychange/focus/blur on either
+# tab self-corrects, and the worst-case outcome is one extra paused or
+# resumed indexing tick. Single-tab use (the common case) is exact.
+_user_active = False
+_visibility_lock = threading.Lock()
+
+
+def _is_user_active() -> bool:
+    """True iff some browser tab is currently visible+focused on the page.
+
+    Combined with subscriber count so a hard tab close (which we detect via
+    SSE disconnect, not via a /visibility report) immediately flips us back
+    to inactive even if the last reported state was active.
+    """
+    with _state_lock:
+        if not _subscribers:
+            return False
+    with _visibility_lock:
+        return _user_active
 
 
 def _active_session_patch(row: dict, active: dict[str, dict]) -> None:
@@ -1727,16 +1988,31 @@ def _watcher_loop(interval: float = 2.0) -> None:
     while True:
         time.sleep(interval)
         upsert, remove = _compute_diff()
-        if not upsert and not remove:
+        if upsert or remove:
+            msg = f"[{time.strftime('%H:%M:%S')}] delta: +{len(upsert)} -{len(remove)}"
+            print(msg)
+            _publish({
+                "type": "delta",
+                "upsert": upsert,
+                "remove": remove,
+                "generated": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            })
+        # Idle indexing: skip while a browser tab is visible+focused on the
+        # page. mtime delta detection above still runs every tick so live
+        # updates never lag.
+        if _is_user_active():
             continue
-        msg = f"[{time.strftime('%H:%M:%S')}] delta: +{len(upsert)} -{len(remove)}"
-        print(msg)
-        _publish({
-            "type": "delta",
-            "upsert": upsert,
-            "remove": remove,
-            "generated": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
-        })
+        try:
+            pending = _index_pick_pending()
+        except sqlite3.Error as e:
+            print(f"index pick error: {e}")
+            pending = None
+        if pending is not None:
+            p, mt, sz = pending
+            try:
+                _index_file(p, mt, sz)
+            except sqlite3.Error as e:
+                print(f"index write error for {p}: {e}")
 
 
 def serve(port: int) -> None:
@@ -1763,8 +2039,25 @@ def serve(port: int) -> None:
                 self._stream_events()
             elif self.path.startswith("/search"):
                 self._handle_search()
+            elif self.path.startswith("/visibility"):
+                self._handle_visibility()
             else:
                 self.send_error(404)
+
+        def do_POST(self):
+            if self.path.startswith("/visibility"):
+                self._handle_visibility()
+            else:
+                self.send_error(404)
+
+        def _handle_visibility(self) -> None:
+            qs = parse_qs(urlparse(self.path).query)
+            state = (qs.get("state") or [""])[0]
+            global _user_active
+            with _visibility_lock:
+                _user_active = (state == "active")
+            self.send_response(204)
+            self.end_headers()
 
         def _handle_search(self) -> None:
             qs = parse_qs(urlparse(self.path).query)
