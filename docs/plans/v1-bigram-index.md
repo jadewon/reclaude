@@ -1,6 +1,8 @@
 # v1: Idle background indexing (bigram inverted index)
 
-Status: draft, reviewed against SQLite 3.53.x (2026-05) capabilities.
+Status: implemented (commits 9462a75, c3d0ef9, fcbb2a4 on
+`claude/background-indexing-idle-EDJVG`). Reviewed against SQLite 3.53.x
+(2026-05) capabilities.
 
 ## Goal
 

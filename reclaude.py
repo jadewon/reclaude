@@ -1858,6 +1858,13 @@ _subscribers: list["queue.Queue[dict]"] = []
 # / blur with state=active|inactive (active iff visible AND focused). The
 # watcher only runs the index builder while no tab is active, so background
 # indexing never competes with foreground browsing.
+#
+# Last-write-wins on a single bool: with two reclaude tabs in different
+# windows, the most recently-fired event determines the state, which can
+# briefly be wrong (active tab still up but inactive tab's blur arrived
+# last). We accept this — the next visibilitychange/focus/blur on either
+# tab self-corrects, and the worst-case outcome is one extra paused or
+# resumed indexing tick. Single-tab use (the common case) is exact.
 _user_active = False
 _visibility_lock = threading.Lock()
 

@@ -48,8 +48,16 @@ Options:
   - `event: delta` is pushed on change, carrying only `{upsert, remove}` by
     session ID — no full payload re-sends.
 - **Client** keeps a `Map` keyed by session ID, applies deltas, re-renders.
+- **Search index** is a SQLite-backed character-bigram inverted index at
+  `~/.cache/reclaude/index.db`. The watcher builds it lazily — one file per
+  tick, only while no browser tab is visible+focused (Page Visibility API
+  + window focus). The index handles Korean and English uniformly; results
+  stay correct during the initial build because un-indexed and stale files
+  fall through to the line-scan verification.
 
-No REST endpoints, no polling from the browser. One long-lived stream per tab.
+The browser POSTs `/visibility` on visibility/focus changes. Other than that
+there are no REST endpoints, no polling from the browser. One long-lived SSE
+stream per tab.
 
 ## UI
 
