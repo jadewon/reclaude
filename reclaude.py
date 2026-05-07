@@ -1822,6 +1822,21 @@ document.addEventListener("keydown", (e) => {{
   }}
 }});
 
+// Idle detection — the server only runs background indexing when no tab is
+// visible+focused. We POST on every transition (visibilitychange / focus /
+// blur), plus once on load to set the initial state.
+function reportVisibility() {{
+  const active = (document.visibilityState === "visible") && document.hasFocus();
+  try {{
+    fetch("/visibility?state=" + (active ? "active" : "inactive"),
+          {{ method: "POST", keepalive: true }}).catch(() => {{}});
+  }} catch (_) {{}}
+}}
+document.addEventListener("visibilitychange", reportVisibility);
+window.addEventListener("focus", reportVisibility);
+window.addEventListener("blur", reportVisibility);
+reportVisibility();
+
 subscribeEvents();
 </script>
 </body>
@@ -1838,6 +1853,27 @@ _rows_by_id: dict[str, dict] = {}           # session_id -> row
 _file_mtime: dict[str, float] = {}          # jsonl path -> mtime (last scanned)
 _file_to_session: dict[str, str] = {}       # jsonl path -> session_id
 _subscribers: list["queue.Queue[dict]"] = []
+
+# Idle detection. The frontend POSTs /visibility on visibilitychange / focus
+# / blur with state=active|inactive (active iff visible AND focused). The
+# watcher only runs the index builder while no tab is active, so background
+# indexing never competes with foreground browsing.
+_user_active = False
+_visibility_lock = threading.Lock()
+
+
+def _is_user_active() -> bool:
+    """True iff some browser tab is currently visible+focused on the page.
+
+    Combined with subscriber count so a hard tab close (which we detect via
+    SSE disconnect, not via a /visibility report) immediately flips us back
+    to inactive even if the last reported state was active.
+    """
+    with _state_lock:
+        if not _subscribers:
+            return False
+    with _visibility_lock:
+        return _user_active
 
 
 def _active_session_patch(row: dict, active: dict[str, dict]) -> None:
@@ -1954,6 +1990,11 @@ def _watcher_loop(interval: float = 2.0) -> None:
                 "remove": remove,
                 "generated": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
             })
+        # Idle indexing: skip while a browser tab is visible+focused on the
+        # page. mtime delta detection above still runs every tick so live
+        # updates never lag.
+        if _is_user_active():
+            continue
         try:
             pending = _index_pick_pending()
         except sqlite3.Error as e:
@@ -1991,8 +2032,25 @@ def serve(port: int) -> None:
                 self._stream_events()
             elif self.path.startswith("/search"):
                 self._handle_search()
+            elif self.path.startswith("/visibility"):
+                self._handle_visibility()
             else:
                 self.send_error(404)
+
+        def do_POST(self):
+            if self.path.startswith("/visibility"):
+                self._handle_visibility()
+            else:
+                self.send_error(404)
+
+        def _handle_visibility(self) -> None:
+            qs = parse_qs(urlparse(self.path).query)
+            state = (qs.get("state") or [""])[0]
+            global _user_active
+            with _visibility_lock:
+                _user_active = (state == "active")
+            self.send_response(204)
+            self.end_headers()
 
         def _handle_search(self) -> None:
             qs = parse_qs(urlparse(self.path).query)
