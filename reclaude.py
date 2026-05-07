@@ -1740,7 +1740,11 @@ def _watcher_loop(interval: float = 2.0) -> None:
 
 
 def serve(port: int) -> None:
+    import socket
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class V6Server(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
 
     _full_scan()
     with _state_lock:
@@ -1821,13 +1825,16 @@ def serve(port: int) -> None:
                 return
             print(f"[{time.strftime('%H:%M:%S')}] " + line)
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    v4 = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    v6 = V6Server(("::1", port), Handler)
     print(f"claude-sessions serving at http://127.0.0.1:{port}/  (Ctrl-C to stop)")
+    threading.Thread(target=v4.serve_forever, daemon=True).start()
     try:
-        server.serve_forever()
+        v6.serve_forever()
     except KeyboardInterrupt:
         print()
-        server.server_close()
+        v4.server_close()
+        v6.server_close()
 
 
 if __name__ == "__main__":
