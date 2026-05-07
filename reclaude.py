@@ -1825,6 +1825,7 @@ def serve(port: int) -> None:
                 return
             print(f"[{time.strftime('%H:%M:%S')}] " + line)
 
+    # Two listeners: macOS ignores IPV6_V6ONLY=0, so ::1 alone won't accept IPv4 (browsers may pick ::1 via happy-eyeballs).
     v4 = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     v6 = V6Server(("::1", port), Handler)
     print(f"claude-sessions serving at http://127.0.0.1:{port}/  (Ctrl-C to stop)")
