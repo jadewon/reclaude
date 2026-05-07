@@ -357,11 +357,19 @@ def _index_pick_pending() -> tuple[pathlib.Path, float, int] | None:
 def _index_lookup(query: str) -> set[str] | None:
     """Return candidate jsonl paths for `query`, or None if index can't filter.
 
-    For each whitespace-split word in the query, the file must contain *all*
-    bigrams of that word (so each word has at least one possible occurrence).
-    Words shorter than 2 codepoints contribute nothing to filtering. If no
-    word contributes any bigram, returns None and callers should fall back
-    to a full scan.
+    The candidate set is:
+
+        (files whose postings match every word's bigrams)
+        ∪ (files on disk that are missing from the index or stale)
+
+    The second term is what makes search correct *while* the index is still
+    being built or while a recently-modified file hasn't been re-indexed yet:
+    those files are always handed to the verification scan rather than being
+    silently excluded. As more files become fresh in the index, the "unknown"
+    term shrinks and the speedup grows.
+
+    Returns None when no word in the query produced any usable bigram (e.g.
+    every word is a single codepoint), so callers fall back to a full scan.
     """
     if not query:
         return None
@@ -369,7 +377,7 @@ def _index_lookup(query: str) -> set[str] | None:
     if not words:
         return None
     conn = _index_conn()
-    final: set[str] | None = None
+    matched: set[str] | None = None
     used_index = False
     for w in words:
         grams = _bigrams_of(w)
@@ -388,15 +396,34 @@ def _index_lookup(query: str) -> set[str] | None:
         if word_paths is None:
             continue
         used_index = True
-        if final is None:
-            final = word_paths
+        if matched is None:
+            matched = word_paths
         else:
-            final &= word_paths
-        if not final:
-            return final
+            matched &= word_paths
     if not used_index:
         return None
-    return final or set()
+    if matched is None:
+        matched = set()
+
+    # Files whose freshness the index can't yet vouch for must be verified
+    # by the line scanner — silently skipping them would produce false
+    # negatives during initial build and during the small window after a
+    # file changes but before the watcher re-indexes it.
+    indexed = {r[0]: (r[1], r[2]) for r in conn.execute(
+        "SELECT path, mtime, size FROM files"
+    )}
+    unknown: set[str] = set()
+    if PROJECTS.exists():
+        for p in PROJECTS.glob("*/*.jsonl"):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            ps = str(p)
+            prev = indexed.get(ps)
+            if prev is None or prev[0] != st.st_mtime or prev[1] != st.st_size:
+                unknown.add(ps)
+    return matched | unknown
 
 
 def _search_sessions(query: str, use_regex: bool = False) -> tuple[list[str], dict[str, list[dict]], dict[str, int]]:
