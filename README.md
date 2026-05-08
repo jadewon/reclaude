@@ -18,6 +18,15 @@ what was I doing last?
 
 ## Install
 
+### Homebrew (macOS, recommended)
+
+```sh
+brew tap jadewon/tap
+brew install reclaude
+```
+
+### From source
+
 Requires Python 3.11+. No third-party packages.
 
 ```sh
@@ -26,10 +35,21 @@ git clone git@github.com:jadewon/reclaude.git ~/.reclaude
 
 ## Run
 
+Homebrew install:
+
+```sh
+reclaude --port 9999
+# or run as a launchd-managed background service:
+brew services start reclaude
+```
+
+From source:
+
 ```sh
 python3 ~/.reclaude/reclaude.py
-# then open http://127.0.0.1:9999/
 ```
+
+Then open http://127.0.0.1:9999/.
 
 Options:
 
