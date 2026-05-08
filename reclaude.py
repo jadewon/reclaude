@@ -616,6 +616,7 @@ def build_html() -> str:
   }}
   * {{ box-sizing: border-box; }}
   html, body {{ margin: 0; padding: 0; height: 100%; }}
+  :root {{ --zoom: 1; }}
   body {{
     font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
     color: var(--fg);
@@ -626,6 +627,7 @@ def build_html() -> str:
     -webkit-font-smoothing: antialiased;
     display: flex;
     flex-direction: column;
+    zoom: var(--zoom);
   }}
   ::selection {{ background: var(--accent); color: var(--bg); }}
 
@@ -1197,6 +1199,8 @@ def build_html() -> str:
       <button id="group-name" class="btn" type="button"><span class="check">□</span>by name</button>
       <button id="toggle-all" class="btn" style="display:none">collapse all</button>
       <span class="count"><span id="count-shown">0</span><span class="sep">/</span><span class="total" id="count-total">0</span></span>
+      <button id="zoom-out" class="btn" type="button" title="smaller text">A−</button>
+      <button id="zoom-in"  class="btn" type="button" title="larger text">A+</button>
       <button id="theme-toggle" class="btn" title="theme">◐</button>
     </div>
     <main>
@@ -1648,6 +1652,12 @@ function openSnippetModal(sid) {{
     }}).join("");
   }}
   document.getElementById("modal-backdrop").style.display = "flex";
+  // Scroll the first highlighted hit into view so long messages don't hide it
+  // below the fold. requestAnimationFrame waits for layout after display flip.
+  requestAnimationFrame(() => {{
+    const firstMark = body.querySelector("mark");
+    if (firstMark) firstMark.scrollIntoView({{ block: "center", behavior: "instant" }});
+  }});
 }}
 
 function closeSnippetModal() {{
@@ -1797,6 +1807,23 @@ document.getElementById("all-btn").addEventListener("click", () => {{
   renderTree();
   render();
 }});
+
+(function initZoom() {{
+  const STEPS = [0.85, 1.0, 1.15, 1.3, 1.5, 1.75];
+  let idx = STEPS.indexOf(parseFloat(localStorage.getItem("sessions-zoom") || "1"));
+  if (idx < 0) idx = 1;
+  function apply() {{
+    document.documentElement.style.setProperty("--zoom", STEPS[idx]);
+    localStorage.setItem("sessions-zoom", String(STEPS[idx]));
+  }}
+  apply();
+  document.getElementById("zoom-in").addEventListener("click", () => {{
+    if (idx < STEPS.length - 1) {{ idx++; apply(); }}
+  }});
+  document.getElementById("zoom-out").addEventListener("click", () => {{
+    if (idx > 0) {{ idx--; apply(); }}
+  }});
+}})();
 
 (function initTheme() {{
   const btn = document.getElementById("theme-toggle");
