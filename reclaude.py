@@ -159,6 +159,14 @@ def _extract_text(obj: dict) -> str:
                         for k in ("text", "content"):
                             if isinstance(sub.get(k), str):
                                 parts.append(sub[k])
+    tur = obj.get("toolUseResult")
+    if isinstance(tur, dict):
+        for k in ("stdout", "stderr", "content", "output"):
+            v = tur.get(k)
+            if isinstance(v, str):
+                parts.append(v)
+    elif isinstance(tur, str):
+        parts.append(tur)
     return "\n".join(p for p in parts if p)
 
 
@@ -519,10 +527,16 @@ def _search_sessions(query: str, use_regex: bool = False) -> tuple[list[str], di
         else:
             qualifies = len(found) == len(words_bytes)
         if qualifies:
-            sids.append(path.stem)
             file_snips = (phrase_snips + word_snips)[:_MAX_SNIPPETS_PER_FILE]
-            if file_snips:
-                snippets[path.stem] = file_snips
+            # Suppress matches we cannot present to the user — when the keyword
+            # only appears in opaque JSON fields (uuid/timestamp/promptId/etc.)
+            # the snippet extractor returns nothing, and the row would render
+            # with an unrelated last_prompt that looks like a false positive.
+            # The client still surfaces metadata-only matches via localSearchIds.
+            if not file_snips:
+                continue
+            sids.append(path.stem)
+            snippets[path.stem] = file_snips
             scores[path.stem] = 2 if phrase_hit else 1
     return sids, snippets, scores
 
