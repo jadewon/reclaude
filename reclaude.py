@@ -5,6 +5,8 @@ Scans ~/.claude/projects/ and serves a real-time dashboard so you can find
 the right session to `claude --resume` after an iTerm/terminal crash.
 """
 
+__version__ = "0.1.0"
+
 import html
 import json
 import os
@@ -2149,5 +2151,6 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Run the Claude Code session browser server")
     ap.add_argument("--port", type=int, default=9999, help="HTTP port (default: 9999)")
+    ap.add_argument("--version", action="version", version=f"reclaude {__version__}")
     args = ap.parse_args()
     serve(args.port)
