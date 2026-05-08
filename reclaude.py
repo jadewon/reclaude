@@ -5,7 +5,7 @@ Scans ~/.claude/projects/ and serves a real-time dashboard so you can find
 the right session to `claude --resume` after an iTerm/terminal crash.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 import html
 import json
