@@ -893,6 +893,7 @@ def build_html() -> str:
 
   /* ───── cells ───── */
   .cell-name {{ display: flex; align-items: center; gap: 10px; min-width: 0; }}
+  .name-stack {{ display: flex; flex-direction: column; gap: 3px; min-width: 0; }}
   .dot {{
     display: inline-block;
     width: 6px;
@@ -946,6 +947,9 @@ def build_html() -> str:
     letter-spacing: 0.08em;
   }}
   .sid::before {{ content: "#"; color: var(--muted-soft); margin-right: 1px; }}
+  .sid-copy {{ cursor: pointer; }}
+  .sid-copy:hover {{ color: var(--accent); }}
+  .sid-copy.copied {{ color: var(--green); }}
 
   .prompt {{
     color: var(--fg-dim);
@@ -1362,13 +1366,14 @@ function renderCwdPath(cwd) {{
 
 function rowHtml(r, showCwd) {{
   const activeCls = r.active ? "dot active" : "dot";
-  const name = r.custom_title
+  const namePart = r.custom_title
     ? `<span class="pill" title="${{escapeHtml(r.custom_title)}}">${{escapeHtml(r.custom_title)}}</span>`
     : `<span class="dash">—</span>`;
+  const name = `<div class="name-stack">${{namePart}}<span class="sid sid-copy" data-sid="${{escapeHtml(r.session_id)}}" title="click to copy full session id\n${{escapeHtml(r.session_id)}}">${{shortId(r.session_id)}}</span></div>`;
   const cwdPretty = r.cwd ? prettyPath(r.cwd) : "";
   const cwdCell = showCwd
-    ? `<div class="cwd-path" title="${{escapeHtml(cwdPretty)}}">${{renderCwdPath(r.cwd)}}</div><div class="sid">${{shortId(r.session_id)}}</div>`
-    : `<div class="sid">${{shortId(r.session_id)}}</div>`;
+    ? `<div class="cwd-path" title="${{escapeHtml(cwdPretty)}}">${{renderCwdPath(r.cwd)}}</div>`
+    : `<div class="cwd-empty"></div>`;
   const contextCell = renderContextCell(r);
   const resumeArg = r.custom_title ? `"${{r.custom_title}}"` : r.session_id;
   const cmd = r.cwd
@@ -1591,6 +1596,18 @@ function render() {{
       render();
     }});
   }});
+  tbody.querySelectorAll(".sid-copy").forEach(el => {{
+    el.addEventListener("click", (e) => {{
+      e.stopPropagation();
+      const sid = el.dataset.sid;
+      if (!sid) return;
+      navigator.clipboard.writeText(sid);
+      const original = el.textContent;
+      el.textContent = "copied";
+      el.classList.add("copied");
+      setTimeout(() => {{ el.textContent = original; el.classList.remove("copied"); }}, 1200);
+    }});
+  }});
   tbody.querySelectorAll(".snippets").forEach(cell => {{
     cell.addEventListener("click", (e) => {{
       e.stopPropagation();
@@ -1743,8 +1760,24 @@ function localSearchIds(q) {{
   return out;
 }}
 
+function syncSearchUrl(q) {{
+  const url = new URL(window.location.href);
+  if (q) {{
+    url.searchParams.set("q", q);
+    if (SEARCH_REGEX_MODE) url.searchParams.set("regex", "1");
+    else url.searchParams.delete("regex");
+  }} else {{
+    url.searchParams.delete("q");
+    url.searchParams.delete("regex");
+  }}
+  // replaceState so typing doesn't bloat browser history; the URL still
+  // becomes shareable / bookmarkable and survives reload.
+  history.replaceState(null, "", url.pathname + (url.search ? url.search : ""));
+}}
+
 async function updateSearch() {{
   const q = document.getElementById("q").value.trim();
+  syncSearchUrl(q);
   if (!q) {{
     SEARCH_RESULT = null;
     SEARCH_SNIPPETS = {{}};
@@ -1879,6 +1912,27 @@ document.addEventListener("visibilitychange", reportVisibility);
 window.addEventListener("focus", reportVisibility);
 window.addEventListener("blur", reportVisibility);
 reportVisibility();
+
+(function initFromUrl() {{
+  function applyParams() {{
+    const params = new URLSearchParams(window.location.search);
+    const q = params.get("q") || "";
+    const regex = params.get("regex") === "1";
+    if (regex !== SEARCH_REGEX_MODE) {{
+      SEARCH_REGEX_MODE = regex;
+      localStorage.setItem("sessions-regex", regex ? "1" : "0");
+      const btn = document.getElementById("regex-mode");
+      const check = btn.querySelector(".check");
+      btn.classList.toggle("active", regex);
+      if (check) check.textContent = regex ? "■" : "□";
+    }}
+    const input = document.getElementById("q");
+    if (input.value !== q) input.value = q;
+    updateSearch();
+  }}
+  applyParams();
+  window.addEventListener("popstate", applyParams);
+}})();
 
 subscribeEvents();
 </script>
