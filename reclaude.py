@@ -5,7 +5,7 @@ Scans ~/.claude/projects/ and serves a real-time dashboard so you can find
 the right session to `claude --resume` after an iTerm/terminal crash.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 import html
 import json
@@ -46,6 +46,7 @@ def _scan_file(path: pathlib.Path) -> dict | None:
     cwd = None
     custom_title = None
     last_prompt = None
+    entrypoint = None
     line_count = 0
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -58,6 +59,8 @@ def _scan_file(path: pathlib.Path) -> dict | None:
                 continue
             if cwd is None and isinstance(obj.get("cwd"), str):
                 cwd = obj["cwd"]
+            if entrypoint is None and isinstance(obj.get("entrypoint"), str):
+                entrypoint = obj["entrypoint"]
             t = obj.get("type")
             if t == "custom-title" and obj.get("customTitle"):
                 custom_title = obj["customTitle"]
@@ -85,6 +88,7 @@ def _scan_file(path: pathlib.Path) -> dict | None:
         "cwd": cwd,
         "custom_title": custom_title,
         "last_prompt": last_prompt,
+        "entrypoint": entrypoint,
         "mtime": mtime,
         "size": size,
         "lines": line_count,
@@ -1198,6 +1202,7 @@ def build_html() -> str:
         <span id="search-spinner" class="search-spinner" aria-hidden="true"></span>
       </div>
       <button id="regex-mode" class="btn" type="button" title="treat query as regex"><span class="check">□</span>regex</button>
+      <button id="hide-desktop" class="btn" type="button" title="hide sessions launched by Claude Desktop (routines)"><span class="check">□</span>hide desktop</button>
       <button id="named-only" class="btn" type="button"><span class="check">□</span>named</button>
       <button id="group-cwd" class="btn" type="button"><span class="check">□</span>by dir</button>
       <button id="group-name" class="btn" type="button"><span class="check">□</span>by name</button>
@@ -1514,6 +1519,7 @@ function renderTree() {{
 
 function render() {{
   const namedOnly = document.getElementById("named-only").classList.contains("active");
+  const hideDesktop = document.getElementById("hide-desktop").classList.contains("active");
   const groupByCwd = document.getElementById("group-cwd").classList.contains("active");
   const groupByName = document.getElementById("group-name").classList.contains("active");
   const grouped = groupByCwd || groupByName;
@@ -1524,6 +1530,7 @@ function render() {{
   const matches = DATA.filter(r => {{
     if (!matchesSelected(r)) return false;
     if (namedOnly && !r.custom_title) return false;
+    if (hideDesktop && r.entrypoint === "claude-desktop") return false;
     if (SEARCH_RESULT === null) return true;
     return SEARCH_RESULT.has(r.session_id);
   }});
@@ -1707,6 +1714,26 @@ function setToggleBtn(id, storageKey) {{
   }});
 }}
 setToggleBtn("named-only", "sessions-named-only");
+
+(function initHideDesktop() {{
+  // Default ON: routine/scheduled sessions launched by Claude Desktop usually
+  // aren't what the user is looking for.
+  const stored = localStorage.getItem("sessions-hide-desktop");
+  const on = stored === null ? true : stored === "1";
+  const btn = document.getElementById("hide-desktop");
+  const check = btn.querySelector(".check");
+  if (on) {{
+    btn.classList.add("active");
+    if (check) check.textContent = "■";
+  }}
+  btn.addEventListener("click", () => {{
+    const next = !btn.classList.contains("active");
+    btn.classList.toggle("active", next);
+    if (check) check.textContent = next ? "■" : "□";
+    localStorage.setItem("sessions-hide-desktop", next ? "1" : "0");
+    render();
+  }});
+}})();
 
 (function initGroupBtns() {{
   const mode = localStorage.getItem("sessions-group-mode") || "none";
