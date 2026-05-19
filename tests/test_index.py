@@ -46,7 +46,7 @@ def main() -> None:
             raise AssertionError("indexing did not converge")
 
         def assert_match(query: str, expected_paths: set[pathlib.Path], use_regex: bool = False) -> None:
-            sids, snippets, scores = reclaude._search_sessions(query, use_regex=use_regex)
+            sids, snippets, scores, _truncated = reclaude._search_sessions(query, use_regex=use_regex)
             got_sids = set(sids)
             expected_sids = {p.stem for p in expected_paths}
             assert got_sids == expected_sids, (

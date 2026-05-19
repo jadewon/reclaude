@@ -5,7 +5,7 @@ Scans ~/.claude/projects/ and serves a real-time dashboard so you can find
 the right session to `claude --resume` after an iTerm/terminal crash.
 """
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 import html
 import json
@@ -440,7 +440,12 @@ def _index_lookup(query: str) -> set[str] | None:
     return matched | unknown
 
 
-def _search_sessions(query: str, use_regex: bool = False) -> tuple[list[str], dict[str, list[dict]], dict[str, int]]:
+_SEARCH_TIME_BUDGET = 2.0  # seconds of line-scan before truncating (newest-first)
+
+
+def _search_sessions(
+    query: str, use_regex: bool = False
+) -> tuple[list[str], dict[str, list[dict]], dict[str, int], bool]:
     """Search every jsonl for the query.
 
     Word-AND mode (default): split query by whitespace; a session matches when
@@ -451,7 +456,7 @@ def _search_sessions(query: str, use_regex: bool = False) -> tuple[list[str], di
     matches when at least one line matches.
     """
     if not query or not PROJECTS.exists():
-        return [], {}, {}
+        return [], {}, {}, False
     pat = None
     pat_bytes = None
     phrase_pat = None
@@ -462,11 +467,11 @@ def _search_sessions(query: str, use_regex: bool = False) -> tuple[list[str], di
             pat = re.compile(query, re.IGNORECASE)
             pat_bytes = re.compile(query.encode("utf-8"), re.IGNORECASE)
         except re.error:
-            return [], {}, {}
+            return [], {}, {}, False
     else:
         word_strs = [w for w in query.lower().split() if w]
         if not word_strs:
-            return [], {}, {}
+            return [], {}, {}, False
         if len(word_strs) >= 2:
             joined = r"[\-_\s]*".join(re.escape(w) for w in word_strs)
             phrase_pat = re.compile(joined, re.IGNORECASE)
@@ -491,7 +496,24 @@ def _search_sessions(query: str, use_regex: bool = False) -> tuple[list[str], di
         else:
             candidate_paths = [pathlib.Path(p) for p in cand]
 
-    for path in candidate_paths:
+    # The bigram index barely narrows common words (every session shares most
+    # bigrams), so the verify+snippet pass would otherwise read every matched
+    # file. Scan newest-first and stop after a wall-clock budget; the UI ranks
+    # by recency anyway, and narrowing the query restores the missing tail.
+    def _mtime(p: pathlib.Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    candidate_paths.sort(key=_mtime, reverse=True)
+    deadline = time.monotonic() + _SEARCH_TIME_BUDGET
+    truncated = False
+
+    for i, path in enumerate(candidate_paths):
+        if i and i % 32 == 0 and time.monotonic() > deadline:
+            truncated = True
+            break
         try:
             with path.open("rb") as f:
                 phrase_snips: list[dict] = []
@@ -544,7 +566,7 @@ def _search_sessions(query: str, use_regex: bool = False) -> tuple[list[str], di
             sids.append(path.stem)
             snippets[path.stem] = file_snips
             scores[path.stem] = 2 if phrase_hit else 1
-    return sids, snippets, scores
+    return sids, snippets, scores, truncated
 
 
 def build_html() -> str:
@@ -862,6 +884,16 @@ def build_html() -> str:
   }}
   .count .sep {{ color: var(--muted-soft); margin: 0 4px; }}
   .count .total {{ color: var(--fg-dim); }}
+  .truncated-note {{
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    padding: 1px 6px;
+    margin-left: 8px;
+    cursor: help;
+  }}
 
   main {{ padding: 0; flex: 1; }}
   table {{
@@ -1208,6 +1240,7 @@ def build_html() -> str:
       <button id="group-name" class="btn" type="button"><span class="check">□</span>by name</button>
       <button id="toggle-all" class="btn" style="display:none">collapse all</button>
       <span class="count"><span id="count-shown">0</span><span class="sep">/</span><span class="total" id="count-total">0</span></span>
+      <span id="truncated-note" class="truncated-note" style="display:none" title="search stopped early to stay responsive — add another word to reach older sessions">partial · refine</span>
       <button id="zoom-out" class="btn" type="button" title="smaller text">A−</button>
       <button id="zoom-in"  class="btn" type="button" title="larger text">A+</button>
       <button id="theme-toggle" class="btn" title="theme">◐</button>
@@ -1810,6 +1843,7 @@ async function updateSearch() {{
     SEARCH_SNIPPETS = {{}};
     SEARCH_SCORES = {{}};
     document.body.classList.remove("searching");
+    document.getElementById("truncated-note").style.display = "none";
     syncContextHeader();
     render();
     return;
@@ -1831,6 +1865,7 @@ async function updateSearch() {{
     SEARCH_RESULT = merged;
     SEARCH_SNIPPETS = d.snippets || {{}};
     SEARCH_SCORES = d.scores || {{}};
+    document.getElementById("truncated-note").style.display = d.truncated ? "inline" : "none";
     render();
   }} catch (e) {{
     // network error: keep local-only results, no snippets
@@ -2187,9 +2222,16 @@ def serve(port: int) -> None:
             qs = parse_qs(urlparse(self.path).query)
             q = (qs.get("q") or [""])[0]
             use_regex = (qs.get("regex") or ["0"])[0] in ("1", "true", "yes")
-            sids, snippets, scores = _search_sessions(q, use_regex=use_regex)
+            sids, snippets, scores, truncated = _search_sessions(q, use_regex=use_regex)
             body = json.dumps(
-                {"q": q, "regex": use_regex, "session_ids": sids, "snippets": snippets, "scores": scores},
+                {
+                    "q": q,
+                    "regex": use_regex,
+                    "session_ids": sids,
+                    "snippets": snippets,
+                    "scores": scores,
+                    "truncated": truncated,
+                },
                 ensure_ascii=False,
             ).encode("utf-8")
             self._send_bytes(body, "application/json; charset=utf-8")
