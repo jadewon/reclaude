@@ -5,7 +5,7 @@ Scans ~/.claude/projects/ and serves a real-time dashboard so you can find
 the right session to `claude --resume` after an iTerm/terminal crash.
 """
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 import html
 import json
@@ -478,6 +478,17 @@ def _search_sessions(
             phrase_pat_bytes = re.compile(joined.encode("utf-8"), re.IGNORECASE)
 
     words_bytes = [w.encode("utf-8") for w in word_strs]
+    # Per-word word-boundary regex (ASCII boundary only — non-ASCII words like
+    # Korean are passed through as None, treating any occurrence as bounded so
+    # we don't penalise compound words.
+    bound_pats: list[re.Pattern[bytes] | None] = []
+    for wb in words_bytes:
+        if wb.isascii():
+            bound_pats.append(
+                re.compile(rb"(?<![A-Za-z0-9_])" + re.escape(wb) + rb"(?![A-Za-z0-9_])", re.IGNORECASE)
+            )
+        else:
+            bound_pats.append(None)
 
     sids: list[str] = []
     snippets: dict[str, list[dict]] = {}
@@ -519,6 +530,7 @@ def _search_sessions(
                 phrase_snips: list[dict] = []
                 word_snips: list[dict] = []
                 found: set[bytes] = set()
+                bounded_found: set[bytes] = set()
                 phrase_hit = False
                 for raw_line in f:
                     line_lower = raw_line.lower()
@@ -530,10 +542,13 @@ def _search_sessions(
                             line_matches = True
                             found.add(b"__regex__")
                     else:
-                        for w_bytes, w_str in zip(words_bytes, word_strs):
+                        for w_bytes, w_str, bp in zip(words_bytes, word_strs, bound_pats):
                             if w_bytes in line_lower:
                                 if w_bytes not in found:
                                     found.add(w_bytes)
+                                if w_bytes not in bounded_found:
+                                    if bp is None or bp.search(line_lower):
+                                        bounded_found.add(w_bytes)
                                 if fallback is None:
                                     fallback = w_str
                                 line_matches = True
@@ -565,7 +580,14 @@ def _search_sessions(
                 continue
             sids.append(path.stem)
             snippets[path.stem] = file_snips
-            scores[path.stem] = 2 if phrase_hit else 1
+            if phrase_hit:
+                scores[path.stem] = 3
+            elif pat_bytes is None and len(bounded_found) == len(words_bytes):
+                # All query words appear as standalone tokens somewhere in the
+                # file — outranks substring-only hits like 'enter' inside 'center'.
+                scores[path.stem] = 2
+            else:
+                scores[path.stem] = 1
     return sids, snippets, scores, truncated
 
 
