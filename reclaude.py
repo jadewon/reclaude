@@ -5,7 +5,7 @@ Scans ~/.claude/projects/ and serves a real-time dashboard so you can find
 the right session to `claude --resume` after an iTerm/terminal crash.
 """
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 import html
 import json
@@ -115,6 +115,7 @@ def gather_rows() -> list[dict]:
 _SNIPPET_BEFORE = 30
 _SNIPPET_AFTER = 110
 _FULL_CAP = 2000
+_MESSAGE_TEXT_CAP = 8000  # per-message text limit in conversation view
 _MAX_SNIPPETS_PER_FILE = 3
 _WS_RUN = re.compile(r"\s+")
 
@@ -176,6 +177,40 @@ def _extract_text(obj: dict) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def _classify_role(obj: dict) -> str:
+    """Map jsonl type + content shape to a user-meaningful role label.
+
+    The wire type is just `user`/`assistant`, but tool_result is delivered
+    as type=user (it's Claude reading tool output) and tool_use is delivered
+    as type=assistant (Claude calling a tool). Both look wrong to a human
+    reading the transcript, so split them out.
+    """
+    t = obj.get("type")
+    if t == "user":
+        if obj.get("isMeta"):
+            return "meta"
+        msg = obj.get("message") or {}
+        c = msg.get("content")
+        if isinstance(c, list):
+            for blk in c:
+                if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                    return "tool"
+        return "user"
+    if t == "assistant":
+        msg = obj.get("message") or {}
+        c = msg.get("content")
+        if isinstance(c, list):
+            has_text = any(
+                isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
+                for b in c
+            )
+            has_tool = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in c)
+            if has_tool and not has_text:
+                return "tool"
+        return "assistant"
+    return t or "?"
+
+
 def _make_snippet(raw_line: bytes, fallback_word: str, regex_pat, phrase_pat) -> dict | None:
     """Parse one jsonl line and return a snippet dict around the best hit.
 
@@ -215,9 +250,7 @@ def _make_snippet(raw_line: bytes, fallback_word: str, regex_pat, phrase_pat) ->
 
     pre = max(0, start - _SNIPPET_BEFORE)
     post = min(len(text), end + _SNIPPET_AFTER)
-    role = obj.get("type") or "?"
-    if role == "user" and obj.get("isMeta"):
-        role = "meta"
+    role = _classify_role(obj)
     full = text if len(text) <= _FULL_CAP else text[: _FULL_CAP] + "…"
     ts_epoch: float | None = None
     raw_ts = obj.get("timestamp")
@@ -591,6 +624,142 @@ def _search_sessions(
     return sids, snippets, scores, truncated
 
 
+def _message_blocks(obj: dict) -> list[dict]:
+    """Split one jsonl line into renderable blocks: text / tool_use / tool_result.
+
+    Each block has {kind, text} and optionally {name} for tool_use.
+    Order matches the original content list. Empty blocks are dropped.
+    """
+    out: list[dict] = []
+    msg = obj.get("message")
+    if isinstance(msg, dict):
+        c = msg.get("content")
+        if isinstance(c, str):
+            if c.strip():
+                out.append({"kind": "text", "text": c})
+        elif isinstance(c, list):
+            for block in c:
+                if not isinstance(block, dict):
+                    continue
+                t = block.get("type")
+                if t == "text":
+                    txt = (block.get("text") or "").strip()
+                    if txt:
+                        out.append({"kind": "text", "text": txt})
+                elif t == "tool_use":
+                    name = block.get("name") or ""
+                    inp = block.get("input")
+                    try:
+                        body = json.dumps(inp, ensure_ascii=False, indent=2) if inp is not None else ""
+                    except (TypeError, ValueError):
+                        body = ""
+                    out.append({"kind": "tool_use", "name": name, "text": body})
+                elif t == "tool_result":
+                    bc = block.get("content")
+                    chunks: list[str] = []
+                    if isinstance(bc, str):
+                        chunks.append(bc)
+                    elif isinstance(bc, list):
+                        for sub in bc:
+                            if isinstance(sub, dict) and sub.get("type") == "text":
+                                chunks.append(sub.get("text") or "")
+                    body = "\n".join(c for c in chunks if c)
+                    if body.strip():
+                        out.append({"kind": "tool_result", "text": body})
+    if obj.get("type") == "summary" and isinstance(obj.get("summary"), str):
+        out.append({"kind": "text", "text": obj["summary"]})
+    if obj.get("type") == "custom-title" and isinstance(obj.get("customTitle"), str):
+        out.append({"kind": "text", "text": obj["customTitle"]})
+    if obj.get("type") == "attachment":
+        att = obj.get("attachment")
+        if isinstance(att, dict):
+            ac = att.get("content")
+            if isinstance(ac, str):
+                if ac.strip():
+                    out.append({"kind": "tool_result", "text": ac})
+            elif isinstance(ac, list):
+                for sub in ac:
+                    if isinstance(sub, dict):
+                        for k in ("text", "content"):
+                            v = sub.get(k)
+                            if isinstance(v, str) and v.strip():
+                                out.append({"kind": "tool_result", "text": v})
+    # toolUseResult duplicates message.content's tool_result on most lines;
+    # only emit it when the inner content didn't already carry a result block.
+    already_has_result = any(b["kind"] == "tool_result" for b in out)
+    if not already_has_result:
+        tur = obj.get("toolUseResult")
+        if isinstance(tur, dict):
+            chunks = []
+            for k in ("stdout", "stderr", "content", "output"):
+                v = tur.get(k)
+                if isinstance(v, str) and v.strip():
+                    chunks.append(v if k != "stderr" else f"[{k}]\n{v}")
+            body = "\n".join(chunks)
+            if body.strip():
+                out.append({"kind": "tool_result", "text": body})
+        elif isinstance(tur, str) and tur.strip():
+            out.append({"kind": "tool_result", "text": tur})
+    # cap each block's text size
+    for b in out:
+        if len(b["text"]) > _MESSAGE_TEXT_CAP:
+            b["text"] = b["text"][:_MESSAGE_TEXT_CAP] + "\n…(truncated)"
+    return out
+
+
+def _session_messages(sid: str, end: int | None, count: int) -> dict | None:
+    """Return a slice of human-readable messages from session `sid`.
+
+    Layout is oldest-first (index 0 = first message, total-1 = newest).
+    end=None means "newest" (== total). The returned slice covers
+    [max(0, end - count), end). Each message: {idx, role, ts, blocks}.
+    Returns None if the session jsonl can't be found.
+    """
+    if not sid or "/" in sid or ".." in sid:
+        return None
+    matches = list(PROJECTS.glob(f"*/{sid}.jsonl"))
+    if not matches:
+        return None
+    path = matches[0]
+    msgs: list[dict] = []
+    try:
+        with path.open("rb") as f:
+            for idx, raw_line in enumerate(f):
+                try:
+                    obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                blocks = _message_blocks(obj)
+                if not blocks:
+                    continue
+                role = _classify_role(obj)
+                ts: float | None = None
+                raw_ts = obj.get("timestamp")
+                if isinstance(raw_ts, str):
+                    try:
+                        ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
+                    except ValueError:
+                        ts = None
+                msgs.append({"idx": idx, "role": role, "ts": ts, "blocks": blocks})
+    except OSError:
+        return None
+    total = len(msgs)
+    if end is None or end > total:
+        end = total
+    if end < 0:
+        end = 0
+    start = max(0, end - max(1, count))
+    return {
+        "sid": sid,
+        "total": total,
+        "slice_start": start,
+        "slice_end": end,
+        "messages": msgs[start:end],
+    }
+
+
 def build_html() -> str:
     home_str = str(HOME)
     html_out = f"""<!doctype html>
@@ -602,6 +771,10 @@ def build_html() -> str:
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..700&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/atom-one-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js" defer></script>
 <style>
   :root {{
     --bg: #0b0e14;
@@ -928,7 +1101,7 @@ def build_html() -> str:
     text-align: left;
     font-weight: 600;
     color: var(--muted);
-    padding: 14px 16px;
+    padding: 8px 12px;
     border-bottom: 1px solid var(--border);
     position: sticky;
     top: 61px;
@@ -937,15 +1110,15 @@ def build_html() -> str:
     letter-spacing: 0.22em;
     text-transform: uppercase;
   }}
-  thead th:first-child {{ padding-left: 32px; }}
-  thead th:last-child {{ padding-right: 32px; text-align: right; }}
+  thead th:first-child {{ padding-left: 24px; }}
+  thead th:last-child {{ padding-right: 24px; text-align: right; }}
   tbody td {{
-    padding: 14px 16px;
+    padding: 6px 12px;
     border-bottom: 1px solid var(--border);
     vertical-align: top;
   }}
-  tbody td:first-child {{ padding-left: 32px; }}
-  tbody td:last-child {{ padding-right: 32px; text-align: right; }}
+  tbody td:first-child {{ padding-left: 24px; }}
+  tbody td:last-child {{ padding-right: 24px; text-align: right; }}
   tbody tr {{ transition: background 0.08s ease; }}
   tbody tr:hover {{ background: var(--row-hover); }}
 
@@ -1097,6 +1270,20 @@ def build_html() -> str:
     line-height: 1;
   }}
   .modal-close:hover {{ color: var(--accent); border-color: var(--accent); }}
+  .modal-expand {{
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    font-size: 14px;
+    width: 32px;
+    height: 32px;
+    cursor: pointer;
+    line-height: 1;
+  }}
+  .modal-expand:hover {{ color: var(--accent); border-color: var(--accent); }}
+  .modal-backdrop.fullscreen {{ padding: 0; }}
+  .modal-backdrop.fullscreen .modal {{ width: 100%; max-width: none; max-height: 100vh; height: 100vh; }}
+  .modal-backdrop.fullscreen .modal-expand {{ color: var(--accent); border-color: var(--accent); }}
   .modal-meta {{
     padding: 10px 22px;
     border-bottom: 1px solid var(--border);
@@ -1133,6 +1320,138 @@ def build_html() -> str:
     word-break: break-word;
     color: var(--fg-dim);
   }}
+
+  .conv-body {{ gap: 14px; }}
+  .conv-msg {{
+    padding: 12px 14px;
+    border-left: 3px solid var(--border-strong);
+    background: var(--surface);
+    border-radius: 0 2px 2px 0;
+  }}
+  .conv-msg-user {{
+    border-left-color: var(--accent);
+    background: var(--accent-soft);
+  }}
+  .conv-msg-assistant {{
+    border-left-color: var(--link);
+    background: var(--surface-hi);
+  }}
+  .conv-msg-tool {{
+    border-left-color: var(--muted-soft);
+    background: var(--surface);
+    padding: 8px 14px;
+  }}
+  .conv-msg-meta-row, .conv-msg-custom-title {{ border-left-color: var(--muted-soft); background: transparent; padding: 6px 14px; font-size: 11px; color: var(--muted); }}
+  .conv-msg-meta {{
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    margin-bottom: 6px;
+    font-size: 10px;
+    color: var(--muted);
+  }}
+  .conv-msg-role {{
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-weight: 700;
+    font-size: 9.5px;
+    padding: 2px 7px;
+    background: var(--bg);
+    color: var(--muted);
+    border-radius: 2px;
+  }}
+  .conv-msg-user .conv-msg-role {{ color: var(--accent); background: rgba(0,0,0,0.25); }}
+  .conv-msg-assistant .conv-msg-role {{ color: var(--link); background: rgba(0,0,0,0.25); }}
+  .conv-msg-tool .conv-msg-role {{ color: var(--muted); }}
+  .conv-msg-ts {{ font-variant-numeric: tabular-nums; }}
+  .conv-msg-text {{
+    font-size: 12.5px;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--fg-dim);
+  }}
+  .conv-start, .conv-empty {{
+    text-align: center;
+    font-size: 11px;
+    color: var(--muted);
+    padding: 12px 0;
+    letter-spacing: 0.06em;
+  }}
+  .conv-msg-blocks {{ display: flex; flex-direction: column; gap: 6px; }}
+  .conv-block {{}}
+  .conv-block-text {{ font-size: 12.5px; line-height: 1.65; color: var(--fg); }}
+  /* tool calls / results collapse by default; click summary to expand */
+  details.conv-block-tool > summary {{
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 4px 8px;
+    background: var(--surface-hi);
+    border-left: 2px solid var(--border-strong);
+    font-size: 11px;
+  }}
+  details.conv-block-tool > summary::-webkit-details-marker {{ display: none; }}
+  details.conv-block-tool > summary::before {{
+    content: "▸";
+    color: var(--muted-soft);
+    font-size: 9px;
+    display: inline-block;
+    width: 8px;
+  }}
+  details.conv-block-tool[open] > summary::before {{ content: "▾"; color: var(--accent); }}
+  details.conv-block-tool[open] > summary {{ border-left-color: var(--accent); }}
+  details.conv-block-tool > summary:hover {{ background: var(--row-hover); }}
+  .conv-block-label {{
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--muted);
+    font-weight: 600;
+  }}
+  details.conv-block-tool[open] .conv-block-label {{ color: var(--accent); }}
+  .conv-tool-size {{ color: var(--muted-soft); font-variant-numeric: tabular-nums; }}
+  .conv-tool-preview {{
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }}
+  .conv-block-raw {{
+    margin: 6px 0 0;
+    padding: 10px 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    overflow-x: auto;
+    font-size: 11.5px;
+    line-height: 1.55;
+  }}
+  .conv-block-raw code {{ font-family: "JetBrains Mono", monospace; color: var(--fg-dim); }}
+
+  /* markdown content */
+  .md {{ font-size: 12.5px; line-height: 1.7; }}
+  .md > *:first-child {{ margin-top: 0; }}
+  .md > *:last-child {{ margin-bottom: 0; }}
+  .md p {{ margin: 0.5em 0; }}
+  .md h1, .md h2, .md h3, .md h4 {{ margin: 0.8em 0 0.4em; line-height: 1.3; color: var(--fg); font-family: "Fraunces", serif; font-style: italic; font-weight: 500; }}
+  .md h1 {{ font-size: 1.45em; }}
+  .md h2 {{ font-size: 1.25em; }}
+  .md h3 {{ font-size: 1.1em; }}
+  .md ul, .md ol {{ margin: 0.4em 0; padding-left: 1.6em; }}
+  .md li {{ margin: 0.15em 0; }}
+  .md blockquote {{ margin: 0.5em 0; padding: 0.2em 0.9em; border-left: 2px solid var(--border-strong); color: var(--fg-dim); }}
+  .md a {{ color: var(--link); text-decoration: underline; text-underline-offset: 2px; }}
+  .md code {{ font-family: "JetBrains Mono", monospace; font-size: 0.92em; background: var(--surface-hi); padding: 1px 5px; border-radius: 2px; color: var(--accent); }}
+  .md pre {{ margin: 0.5em 0; padding: 0; background: transparent; overflow-x: auto; }}
+  .md pre code {{ display: block; padding: 10px 12px; background: var(--surface); border: 1px solid var(--border); font-size: 11.5px; line-height: 1.55; color: var(--fg-dim); border-radius: 0; }}
+  .md hr {{ border: none; border-top: 1px solid var(--border); margin: 1em 0; }}
+  .md-fallback {{ font-family: "JetBrains Mono", monospace; font-size: 12.5px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; color: var(--fg-dim); }}
+  .prompt-clickable {{ cursor: pointer; }}
+  .prompt-clickable:hover {{ color: var(--accent); }}
 
   .when {{
     color: var(--muted);
@@ -1299,10 +1618,23 @@ def build_html() -> str:
   <div class="modal" role="dialog" aria-modal="true">
     <div class="modal-head">
       <div class="modal-title" id="modal-title"></div>
+      <button class="modal-expand" data-backdrop="modal-backdrop" type="button" aria-label="toggle fullscreen" title="fullscreen (f)">⛶</button>
       <button class="modal-close" id="modal-close" type="button" aria-label="close">×</button>
     </div>
     <div class="modal-meta" id="modal-meta"></div>
     <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<div id="conv-backdrop" class="modal-backdrop" style="display:none">
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <div class="modal-title" id="conv-title"></div>
+      <button class="modal-expand" data-backdrop="conv-backdrop" type="button" aria-label="toggle fullscreen" title="fullscreen (f)">⛶</button>
+      <button class="modal-close" id="conv-close" type="button" aria-label="close">×</button>
+    </div>
+    <div class="modal-meta" id="conv-meta"></div>
+    <div class="modal-body conv-body" id="conv-body"></div>
   </div>
 </div>
 
@@ -1482,7 +1814,8 @@ function renderContextCell(r) {{
     return `<div class="snippets" data-sid="${{escapeHtml(r.session_id)}}" title="click to view full context">${{items}}</div>`;
   }}
   const prompt = r.last_prompt ? escapeHtml(r.last_prompt) : "";
-  return `<div class="prompt" title="${{escapeHtml(r.last_prompt || "")}}">${{prompt}}</div>`;
+  const title = r.last_prompt ? "click to view conversation" : "click to view conversation (no prompt preview)";
+  return `<div class="prompt prompt-clickable" data-sid="${{escapeHtml(r.session_id)}}" title="${{title}}">${{prompt || "&mdash;"}}</div>`;
 }}
 
 const COLLAPSED = new Set();
@@ -1676,6 +2009,12 @@ function render() {{
       openSnippetModal(cell.dataset.sid);
     }});
   }});
+  tbody.querySelectorAll(".prompt-clickable").forEach(cell => {{
+    cell.addEventListener("click", (e) => {{
+      e.stopPropagation();
+      openConvModal(cell.dataset.sid);
+    }});
+  }});
 }}
 
 function buildHighlightRegex() {{
@@ -1731,6 +2070,7 @@ function openSnippetModal(sid) {{
     }}).join("");
   }}
   document.getElementById("modal-backdrop").style.display = "flex";
+  applyModalFullscreen("modal-backdrop");
   // Scroll the first highlighted hit into view so long messages don't hide it
   // below the fold. requestAnimationFrame waits for layout after display flip.
   requestAnimationFrame(() => {{
@@ -1750,6 +2090,180 @@ document.getElementById("modal-backdrop").addEventListener("click", (e) => {{
 document.addEventListener("keydown", (e) => {{
   if (e.key === "Escape" && document.getElementById("modal-backdrop").style.display !== "none") {{
     closeSnippetModal();
+  }}
+}});
+
+// ───── conversation modal (full session, reverse-infinite scroll) ─────
+let CONV_STATE = null;  // {{sid, sliceStart, loading, exhausted}}
+const CONV_BATCH = 30;
+const CONV_LOAD_NEAR_TOP_PX = 200;
+
+function fmtMsgTs(ts) {{
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  return d.toISOString().slice(0, 19).replace("T", " ");
+}}
+
+function renderMd(rawText) {{
+  // marked + DOMPurify load via CDN; if either is missing (offline), fall
+  // back to escaped pre-wrap text so the modal still renders something.
+  if (typeof marked === "undefined" || typeof DOMPurify === "undefined") {{
+    return `<div class="md-fallback">${{escapeHtml(rawText)}}</div>`;
+  }}
+  try {{
+    const html = marked.parse(rawText, {{ breaks: true, gfm: true }});
+    return `<div class="md">${{DOMPurify.sanitize(html)}}</div>`;
+  }} catch (e) {{
+    return `<div class="md-fallback">${{escapeHtml(rawText)}}</div>`;
+  }}
+}}
+
+function renderConvBlock(b) {{
+  const txt = b.text || "";
+  if (b.kind === "tool_use" || b.kind === "tool_result") {{
+    const firstLine = txt.split("\\n", 1)[0].slice(0, 100);
+    const preview = escapeHtml(firstLine) + (txt.length > firstLine.length ? "…" : "");
+    const label = b.kind === "tool_use" ? ("tool · " + escapeHtml(b.name || "")) : "tool · result";
+    return `<details class="conv-block conv-block-tool">
+      <summary class="conv-block-summary"><span class="conv-block-label">${{label}}</span><span class="conv-tool-size">${{txt.length}} chars</span><span class="conv-tool-preview">${{preview}}</span></summary>
+      <pre class="conv-block-raw"><code>${{escapeHtml(txt)}}</code></pre>
+    </details>`;
+  }}
+  // text block → markdown
+  return `<div class="conv-block conv-block-text">${{renderMd(txt)}}</div>`;
+}}
+
+function highlightCodeIn(root) {{
+  if (typeof hljs === "undefined") return;
+  root.querySelectorAll("pre code").forEach(el => {{
+    try {{ hljs.highlightElement(el); }} catch (e) {{}}
+  }});
+}}
+
+function renderConvMessage(m) {{
+  const role = escapeHtml(m.role || "?");
+  const ts = fmtMsgTs(m.ts);
+  const blocks = (m.blocks || []).map(renderConvBlock).join("");
+  return `<div class="conv-msg conv-msg-${{escapeHtml(m.role || "x")}}" data-idx="${{m.idx}}">
+    <div class="conv-msg-meta"><span class="conv-msg-role">${{role}}</span><span class="conv-msg-ts">${{ts}}</span></div>
+    <div class="conv-msg-blocks">${{blocks}}</div>
+  </div>`;
+}}
+
+async function openConvModal(sid) {{
+  const row = ROWS.get(sid);
+  const title = (row && row.custom_title) || "(unnamed)";
+  document.getElementById("conv-title").textContent = title;
+  const cwd = row && row.cwd ? prettyPath(row.cwd) : "(unknown)";
+  const meta = document.getElementById("conv-meta");
+  meta.innerHTML = `<span>${{escapeHtml(cwd)}}</span><span class="sep">·</span><span>${{escapeHtml(shortId(sid))}}</span><span class="sep">·</span><span id="conv-pos">loading…</span>`;
+  const body = document.getElementById("conv-body");
+  body.innerHTML = "";
+  CONV_STATE = {{ sid, sliceStart: null, loading: false, exhausted: false }};
+  document.getElementById("conv-backdrop").style.display = "flex";
+  applyModalFullscreen("conv-backdrop");
+  // first page: end omitted → server returns the latest CONV_BATCH
+  const d = await fetchConv(sid, null);
+  if (!d || CONV_STATE === null || CONV_STATE.sid !== sid) return;
+  body.innerHTML = d.messages.map(renderConvMessage).join("") || `<div class="conv-empty">(no readable messages)</div>`;
+  highlightCodeIn(body);
+  // expand any tool block that contains a highlighted hit on demand — keep
+  // collapsed by default so this is opt-in.
+  CONV_STATE.sliceStart = d.slice_start;
+  CONV_STATE.exhausted = (d.slice_start === 0);
+  document.getElementById("conv-pos").textContent = `${{d.slice_start}}–${{d.slice_end}} of ${{d.total}}`;
+  // pin to bottom so user sees newest first
+  requestAnimationFrame(() => {{ body.scrollTop = body.scrollHeight; }});
+  // remove any listener left by a previous open (e.g. user clicks a second
+  // session without closing the first) so scroll doesn't double-fire.
+  body.removeEventListener("scroll", onConvScroll);
+  body.addEventListener("scroll", onConvScroll);
+}}
+
+async function fetchConv(sid, end) {{
+  const params = new URLSearchParams({{ sid, count: String(CONV_BATCH) }});
+  if (end != null) params.set("end", String(end));
+  try {{
+    const res = await fetch("/messages?" + params.toString());
+    if (!res.ok) return null;
+    return await res.json();
+  }} catch (e) {{
+    return null;
+  }}
+}}
+
+async function onConvScroll(e) {{
+  const body = e.target;
+  if (!CONV_STATE || CONV_STATE.loading || CONV_STATE.exhausted) return;
+  if (body.scrollTop > CONV_LOAD_NEAR_TOP_PX) return;
+  CONV_STATE.loading = true;
+  const sid = CONV_STATE.sid;
+  const end = CONV_STATE.sliceStart;
+  const heightBefore = body.scrollHeight;
+  const scrollBefore = body.scrollTop;
+  const d = await fetchConv(sid, end);
+  if (CONV_STATE === null || CONV_STATE.sid !== sid) return;  // modal replaced — drop
+  if (!d) {{ CONV_STATE.loading = false; return; }}  // transient error — allow retry on next scroll
+  if (!d.messages.length) {{
+    CONV_STATE.exhausted = true;
+    CONV_STATE.loading = false;
+    return;
+  }}
+  const olderHtml = d.messages.map(renderConvMessage).join("");
+  body.insertAdjacentHTML("afterbegin", olderHtml);
+  highlightCodeIn(body);  // hljs is idempotent on already-highlighted blocks
+  // preserve viewport: adjust scrollTop by added height
+  body.scrollTop = scrollBefore + (body.scrollHeight - heightBefore);
+  CONV_STATE.sliceStart = d.slice_start;
+  CONV_STATE.exhausted = (d.slice_start === 0);
+  document.getElementById("conv-pos").textContent = `${{d.slice_start}}–${{d.slice_end}} of ${{d.total}}`;
+  if (CONV_STATE.exhausted) {{
+    body.insertAdjacentHTML("afterbegin", `<div class="conv-start">(start of session)</div>`);
+  }}
+  CONV_STATE.loading = false;
+}}
+
+function closeConvModal() {{
+  document.getElementById("conv-backdrop").style.display = "none";
+  const body = document.getElementById("conv-body");
+  body.removeEventListener("scroll", onConvScroll);
+  body.innerHTML = "";
+  CONV_STATE = null;
+}}
+
+// fullscreen toggle for both modals (preference persists)
+function applyModalFullscreen(backdropId) {{
+  const bd = document.getElementById(backdropId);
+  const on = localStorage.getItem("sessions-modal-fullscreen") === "1";
+  bd.classList.toggle("fullscreen", on);
+}}
+document.querySelectorAll(".modal-expand").forEach(btn => {{
+  btn.addEventListener("click", (e) => {{
+    e.stopPropagation();
+    const bdId = btn.dataset.backdrop;
+    const bd = document.getElementById(bdId);
+    const on = !bd.classList.contains("fullscreen");
+    localStorage.setItem("sessions-modal-fullscreen", on ? "1" : "0");
+    document.querySelectorAll(".modal-backdrop").forEach(x => x.classList.toggle("fullscreen", on));
+  }});
+}});
+// `f` key toggles fullscreen on whichever modal is open
+document.addEventListener("keydown", (e) => {{
+  if (e.key !== "f" || e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+  const open = [...document.querySelectorAll(".modal-backdrop")].find(b => b.style.display !== "none");
+  if (!open) return;
+  const on = !open.classList.contains("fullscreen");
+  localStorage.setItem("sessions-modal-fullscreen", on ? "1" : "0");
+  document.querySelectorAll(".modal-backdrop").forEach(x => x.classList.toggle("fullscreen", on));
+}});
+
+document.getElementById("conv-close").addEventListener("click", closeConvModal);
+document.getElementById("conv-backdrop").addEventListener("click", (e) => {{
+  if (e.target.id === "conv-backdrop") closeConvModal();
+}});
+document.addEventListener("keydown", (e) => {{
+  if (e.key === "Escape" && document.getElementById("conv-backdrop").style.display !== "none") {{
+    closeConvModal();
   }}
 }});
 
@@ -2220,6 +2734,8 @@ def serve(port: int) -> None:
                 self._stream_events()
             elif self.path.startswith("/search"):
                 self._handle_search()
+            elif self.path.startswith("/messages"):
+                self._handle_messages()
             elif self.path.startswith("/visibility"):
                 self._handle_visibility()
             else:
@@ -2239,6 +2755,27 @@ def serve(port: int) -> None:
                 _user_active = (state == "active")
             self.send_response(204)
             self.end_headers()
+
+        def _handle_messages(self) -> None:
+            qs = parse_qs(urlparse(self.path).query)
+            sid = (qs.get("sid") or [""])[0]
+            try:
+                count = int((qs.get("count") or ["30"])[0])
+            except ValueError:
+                count = 30
+            end_str = (qs.get("end") or [""])[0]
+            end: int | None
+            try:
+                end = int(end_str) if end_str else None
+            except ValueError:
+                end = None
+            count = max(1, min(count, 200))
+            result = _session_messages(sid, end, count)
+            if result is None:
+                self.send_error(404)
+                return
+            body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+            self._send_bytes(body, "application/json; charset=utf-8")
 
         def _handle_search(self) -> None:
             qs = parse_qs(urlparse(self.path).query)
