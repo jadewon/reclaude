@@ -1646,7 +1646,7 @@ let SEARCH_RESULT = null;  // null = no active search; Set<session_id> when acti
 let SEARCH_SNIPPETS = {{}};  // session_id -> snippet array (role, before, match, after)
 let SEARCH_SCORES = {{}};    // session_id -> int (2 = phrase hit, 1 = word matches)
 let SEARCH_REQ_ID = 0;
-let SEARCH_REGEX_MODE = localStorage.getItem("sessions-regex") === "1";
+let SEARCH_REGEX_MODE = new URLSearchParams(window.location.search).get("regex") === "1" || localStorage.getItem("sessions-regex") === "1";
 
 function rebuildData() {{
   DATA = [...ROWS.values()].sort((a, b) => b.mtime - a.mtime);
@@ -2432,6 +2432,17 @@ document.getElementById("q").addEventListener("input", () => {{
   }});
 }})();
 
+// Deep-link: if the page loads with ?q=... (e.g. a shared/bookmarked search
+// URL written by syncSearchUrl), pre-fill the box and run the search so the
+// URL actually "survives reload" as the comment there claims.
+(function initSearchFromUrl() {{
+  const q = new URLSearchParams(window.location.search).get("q");
+  if (q) {{
+    document.getElementById("q").value = q;
+    updateSearch();
+  }}
+}})();
+
 document.getElementById("all-btn").addEventListener("click", () => {{
   SELECTED_PATH = "";
   localStorage.setItem("sessions-selected-path", "");
@@ -2728,7 +2739,7 @@ def serve(port: int) -> None:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path in ("/", "/index.html"):
+            if urlparse(self.path).path in ("/", "/index.html"):
                 self._send_bytes(template_bytes, "text/html; charset=utf-8")
             elif self.path == "/events":
                 self._stream_events()
