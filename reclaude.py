@@ -184,6 +184,10 @@ def _classify_role(obj: dict) -> str:
     as type=user (it's Claude reading tool output) and tool_use is delivered
     as type=assistant (Claude calling a tool). Both look wrong to a human
     reading the transcript, so split them out.
+
+    Local `!cmd` / slash-command output is also recorded as a type=user string
+    message wrapped in <bash-stdout>/<local-command-stdout> etc. — it's machine
+    output, not something the human typed, so classify it as "tool" too.
     """
     t = obj.get("type")
     if t == "user":
@@ -191,10 +195,22 @@ def _classify_role(obj: dict) -> str:
             return "meta"
         msg = obj.get("message") or {}
         c = msg.get("content")
-        if isinstance(c, list):
+        head = None
+        if isinstance(c, str):
+            head = c.lstrip()
+        elif isinstance(c, list):
             for blk in c:
-                if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                if not isinstance(blk, dict):
+                    continue
+                if blk.get("type") == "tool_result":
                     return "tool"
+                if blk.get("type") == "text" and head is None:
+                    head = (blk.get("text") or "").lstrip()
+        if head and head.startswith((
+            "<bash-stdout>", "<bash-stderr>", "<bash-input>",
+            "<local-command-stdout>", "<local-command-stderr>",
+        )):
+            return "tool"
         return "user"
     if t == "assistant":
         msg = obj.get("message") or {}
@@ -208,21 +224,27 @@ def _classify_role(obj: dict) -> str:
             if has_tool and not has_text:
                 return "tool"
         return "assistant"
-    return t or "?"
+    # everything else (system, summary, attachment, file-history-snapshot, …)
+    # collapses to meta so the four user/assistant/tool/meta filters cover all.
+    return "meta"
 
 
-def _make_snippet(raw_line: bytes, fallback_word: str, regex_pat, phrase_pat) -> dict | None:
+def _make_snippet(raw_line: bytes, fallback_word: str, regex_pat, phrase_pat, obj: dict | None = None) -> dict | None:
     """Parse one jsonl line and return a snippet dict around the best hit.
 
     Match-finding priority:
       1. phrase_pat (multi-word query joined with optional [-_\\s]* separators)
       2. regex_pat (when in regex mode)
       3. fallback_word (a single literal word from word-AND mode)
+
+    Pass `obj` to reuse a line already parsed by the caller (role filtering)
+    and avoid a second json.loads of the same line.
     """
-    try:
-        obj = json.loads(raw_line.decode("utf-8", errors="replace"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
+    if obj is None:
+        try:
+            obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
     if not isinstance(obj, dict):
         return None
     text = _extract_text(obj)
@@ -477,7 +499,7 @@ _SEARCH_TIME_BUDGET = 2.0  # seconds of line-scan before truncating (newest-firs
 
 
 def _search_sessions(
-    query: str, use_regex: bool = False
+    query: str, use_regex: bool = False, roles: set[str] | None = None
 ) -> tuple[list[str], dict[str, list[dict]], dict[str, int], bool]:
     """Search every jsonl for the query.
 
@@ -487,6 +509,11 @@ def _search_sessions(
 
     Regex mode: query is compiled as a single case-insensitive regex; a session
     matches when at least one line matches.
+
+    `roles` restricts which message kinds (per `_classify_role`: user /
+    assistant / tool / meta) a hit may come from. None means no restriction;
+    an empty set matches nothing. Lines are only parsed (to classify) when they
+    already contain a raw byte hit, so the common non-matching line stays cheap.
     """
     if not query or not PROJECTS.exists():
         return [], {}, {}, False
@@ -560,20 +587,38 @@ def _search_sessions(
             break
         try:
             with path.open("rb") as f:
-                phrase_snips: list[dict] = []
-                word_snips: list[dict] = []
+                phrase_cands: list[tuple] = []
+                word_cands: list[tuple] = []
                 found: set[bytes] = set()
                 bounded_found: set[bytes] = set()
                 phrase_hit = False
                 for raw_line in f:
                     line_lower = raw_line.lower()
+                    # Fast byte prefilter: skip lines with no raw hit at all so
+                    # we never parse JSON for the overwhelming majority of lines.
+                    if pat_bytes is not None:
+                        if not pat_bytes.search(raw_line):
+                            continue
+                    elif not any(wb in line_lower for wb in words_bytes):
+                        continue
+                    # This line has a raw hit. When a role filter is active, parse
+                    # it once and drop the whole line unless it's an allowed role
+                    # (so a keyword that only appears in git log / tool output does
+                    # not qualify the session).
+                    obj = None
+                    if roles is not None:
+                        try:
+                            obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            continue
+                        if not isinstance(obj, dict) or _classify_role(obj) not in roles:
+                            continue
                     fallback: str | None = None
                     line_matches = False
                     is_phrase_line = False
                     if pat_bytes is not None:
-                        if pat_bytes.search(raw_line):
-                            line_matches = True
-                            found.add(b"__regex__")
+                        line_matches = True
+                        found.add(b"__regex__")
                     else:
                         for w_bytes, w_str, bp in zip(words_bytes, word_strs, bound_pats):
                             if w_bytes in line_lower:
@@ -588,14 +633,19 @@ def _search_sessions(
                         if phrase_pat_bytes is not None and phrase_pat_bytes.search(line_lower):
                             is_phrase_line = True
                             phrase_hit = True
-                    if is_phrase_line and len(phrase_snips) < _MAX_SNIPPETS_PER_FILE:
-                        snip = _make_snippet(raw_line, fallback or "", pat, phrase_pat)
-                        if snip is not None:
-                            phrase_snips.append(snip)
-                    elif line_matches and not is_phrase_line and len(word_snips) < _MAX_SNIPPETS_PER_FILE:
-                        snip = _make_snippet(raw_line, fallback or "", pat, phrase_pat)
-                        if snip is not None:
-                            word_snips.append(snip)
+                    # Collect match candidates, keeping only the most RECENT few
+                    # of each kind (rows are recency-ranked and the latest mention
+                    # is usually the session's conclusion). Snippets are built
+                    # after the loop, so a keyword in the final answer is never
+                    # hidden by a first-N-then-truncate window.
+                    if is_phrase_line:
+                        phrase_cands.append((raw_line, obj, fallback or ""))
+                        if len(phrase_cands) > _MAX_SNIPPETS_PER_FILE:
+                            phrase_cands.pop(0)
+                    elif line_matches:
+                        word_cands.append((raw_line, obj, fallback or ""))
+                        if len(word_cands) > _MAX_SNIPPETS_PER_FILE:
+                            word_cands.pop(0)
         except OSError:
             continue
         if pat_bytes is not None:
@@ -603,7 +653,13 @@ def _search_sessions(
         else:
             qualifies = len(found) == len(words_bytes)
         if qualifies:
-            file_snips = (phrase_snips + word_snips)[:_MAX_SNIPPETS_PER_FILE]
+            file_snips: list[dict] = []
+            for cand_line, cand_obj, cand_fb in (phrase_cands + word_cands):
+                snip = _make_snippet(cand_line, cand_fb, pat, phrase_pat, obj=cand_obj)
+                if snip is not None:
+                    file_snips.append(snip)
+                if len(file_snips) >= _MAX_SNIPPETS_PER_FILE:
+                    break
             # Suppress matches we cannot present to the user — when the keyword
             # only appears in opaque JSON fields (uuid/timestamp/promptId/etc.)
             # the snippet extractor returns nothing, and the row would render
@@ -998,17 +1054,58 @@ def build_html() -> str:
     padding: 14px 32px;
     display: flex;
     gap: 10px;
-    align-items: center;
+    align-items: flex-start;
     border-bottom: 1px solid var(--border);
     background: var(--bg);
     position: sticky;
     top: 0;
     z-index: 10;
   }}
-  .search-wrap {{
+  .toolbar > .btn, .toolbar > .count, .toolbar > .truncated-note {{ margin-top: 1px; }}
+  .search-col {{
     flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }}
+  .search-wrap {{
     position: relative;
   }}
+  .role-filter {{
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+  }}
+  .role-label {{
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-right: 2px;
+  }}
+  .role-chip {{
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    padding: 3px 9px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: lowercase;
+    white-space: nowrap;
+    border-radius: 999px;
+  }}
+  .role-chip:hover {{ border-color: var(--border-strong); color: var(--fg); }}
+  .role-chip.active {{
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent);
+  }}
+  .role-chip .check {{ margin-right: 4px; color: var(--muted-soft); }}
+  .role-chip.active .check {{ color: var(--accent); }}
   .search-wrap::before {{
     content: "/";
     position: absolute;
@@ -1104,7 +1201,7 @@ def build_html() -> str:
     padding: 8px 12px;
     border-bottom: 1px solid var(--border);
     position: sticky;
-    top: 61px;
+    top: var(--thead-top, 61px);
     background: var(--bg);
     font-size: 10px;
     letter-spacing: 0.22em;
@@ -1225,6 +1322,73 @@ def build_html() -> str:
     font-weight: 600;
     border-radius: 2px;
   }}
+  /* the match the user is currently parked on (search nav in the viewer) */
+  .modal-body mark.active-hit {{
+    background: var(--accent);
+    color: var(--bg);
+    box-shadow: 0 0 0 2px var(--accent);
+  }}
+  .conv-hits {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+    margin-right: 8px;
+  }}
+  .conv-hit-pos {{
+    font-size: 11px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.04em;
+    min-width: 44px;
+    text-align: center;
+  }}
+  .conv-hit-btn {{
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    width: 24px;
+    height: 24px;
+    line-height: 1;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 15px;
+    border-radius: 4px;
+  }}
+  .conv-hit-btn:hover:not(:disabled) {{ border-color: var(--accent); color: var(--accent); }}
+  .conv-hit-btn:disabled {{ opacity: 0.3; cursor: default; }}
+  .conv-hit-label {{
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 0.03em;
+    margin-right: 6px;
+    white-space: nowrap;
+  }}
+  .conv-title-id {{
+    color: var(--muted);
+    font-weight: 500;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.9em;
+  }}
+  .conv-title-sep {{ color: var(--muted-soft); margin: 0 10px; }}
+  .conv-title-ico {{ color: var(--muted); margin-right: 5px; font-weight: 400; }}
+  .conv-title-q {{ font-weight: 400; font-size: 0.92em; }}
+  #conv-title mark {{
+    background: var(--accent-soft);
+    color: var(--accent);
+    padding: 0 4px;
+    margin: 0 3px;
+    border-radius: 2px;
+    font-weight: 600;
+  }}
+  .conv-roles {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding: 8px 18px 10px;
+    border-bottom: 1px solid var(--border);
+  }}
 
   .modal-backdrop {{
     position: fixed;
@@ -1328,20 +1492,32 @@ def build_html() -> str:
     background: var(--surface);
     border-radius: 0 2px 2px 0;
   }}
-  .conv-msg-user {{
+  .conv-msg[data-role="user"] {{
     border-left-color: var(--accent);
     background: var(--accent-soft);
   }}
-  .conv-msg-assistant {{
+  .conv-msg[data-role="assistant"] {{
     border-left-color: var(--link);
     background: var(--surface-hi);
   }}
-  .conv-msg-tool {{
+  .conv-msg[data-role="tool"] {{
     border-left-color: var(--muted-soft);
     background: var(--surface);
     padding: 8px 14px;
   }}
-  .conv-msg-meta-row, .conv-msg-custom-title {{ border-left-color: var(--muted-soft); background: transparent; padding: 6px 14px; font-size: 11px; color: var(--muted); }}
+  .conv-msg[data-role="meta"] {{
+    border-left-color: var(--muted-soft);
+    background: transparent;
+    padding: 6px 14px;
+    font-size: 11px;
+    color: var(--muted);
+  }}
+  /* role visibility — toggled by the viewer's `show` chips */
+  .conv-body .conv-msg {{ display: none; }}
+  .conv-body.show-user .conv-msg[data-role="user"],
+  .conv-body.show-assistant .conv-msg[data-role="assistant"],
+  .conv-body.show-tool .conv-msg[data-role="tool"],
+  .conv-body.show-meta .conv-msg[data-role="meta"] {{ display: block; }}
   .conv-msg-meta {{
     display: flex;
     gap: 10px;
@@ -1360,9 +1536,9 @@ def build_html() -> str:
     color: var(--muted);
     border-radius: 2px;
   }}
-  .conv-msg-user .conv-msg-role {{ color: var(--accent); background: rgba(0,0,0,0.25); }}
-  .conv-msg-assistant .conv-msg-role {{ color: var(--link); background: rgba(0,0,0,0.25); }}
-  .conv-msg-tool .conv-msg-role {{ color: var(--muted); }}
+  .conv-msg[data-role="user"] .conv-msg-role {{ color: var(--accent); background: rgba(0,0,0,0.25); }}
+  .conv-msg[data-role="assistant"] .conv-msg-role {{ color: var(--link); background: rgba(0,0,0,0.25); }}
+  .conv-msg[data-role="tool"] .conv-msg-role {{ color: var(--muted); }}
   .conv-msg-ts {{ font-variant-numeric: tabular-nums; }}
   .conv-msg-text {{
     font-size: 12.5px;
@@ -1378,9 +1554,21 @@ def build_html() -> str:
     padding: 12px 0;
     letter-spacing: 0.06em;
   }}
-  .conv-msg-blocks {{ display: flex; flex-direction: column; gap: 6px; }}
+  .conv-msg-blocks {{
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 10px;
+    background: rgba(127, 127, 127, 0.06);
+    border-radius: 3px;
+  }}
   .conv-block {{}}
   .conv-block-text {{ font-size: 12.5px; line-height: 1.65; color: var(--fg); }}
+  /* markdown tables inside a message: keep the (inherited) header styling but
+     give the body its own surface so rows read apart from the block bg */
+  .conv-block-text table {{ table-layout: auto; }}
+  .conv-block-text tbody {{ background: var(--surface); }}
+  .conv-block-text tbody td {{ border-bottom: 1px solid var(--border); }}
   /* tool calls / results collapse by default; click summary to expand */
   details.conv-block-tool > summary {{
     cursor: pointer;
@@ -1570,9 +1758,18 @@ def build_html() -> str:
   </aside>
   <div class="content">
     <div class="toolbar">
-      <div class="search-wrap">
-        <input id="q" type="text" placeholder="search names, paths, ids, full content…" autofocus>
-        <span id="search-spinner" class="search-spinner" aria-hidden="true"></span>
+      <div class="search-col">
+        <div class="search-wrap">
+          <input id="q" type="text" placeholder="search names, paths, ids, full content…" autofocus>
+          <span id="search-spinner" class="search-spinner" aria-hidden="true"></span>
+        </div>
+        <div class="role-filter" id="role-filter" title="which message types the full-text search looks inside">
+          <span class="role-label">search in</span>
+          <button class="role-chip" data-role="user" type="button"><span class="check">■</span>you</button>
+          <button class="role-chip" data-role="assistant" type="button"><span class="check">■</span>claude</button>
+          <button class="role-chip" data-role="tool" type="button"><span class="check">□</span>tools</button>
+          <button class="role-chip" data-role="meta" type="button"><span class="check">□</span>meta</button>
+        </div>
       </div>
       <button id="regex-mode" class="btn" type="button" title="treat query as regex"><span class="check">□</span>regex</button>
       <button id="hide-desktop" class="btn" type="button" title="hide sessions launched by Claude Desktop (routines)"><span class="check">□</span>hide desktop</button>
@@ -1630,10 +1827,23 @@ def build_html() -> str:
   <div class="modal" role="dialog" aria-modal="true">
     <div class="modal-head">
       <div class="modal-title" id="conv-title"></div>
+      <span id="conv-hits" class="conv-hits" style="display:none" title="next: Enter or → · prev: Shift+Enter or ←">
+        <span class="conv-hit-label">use ← / → to step through matches:</span>
+        <button id="conv-hit-prev" class="conv-hit-btn" type="button" title="previous match (← or Shift+Enter)">‹</button>
+        <span id="conv-hit-pos" class="conv-hit-pos"></span>
+        <button id="conv-hit-next" class="conv-hit-btn" type="button" title="next match (→ or Enter)">›</button>
+      </span>
       <button class="modal-expand" data-backdrop="conv-backdrop" type="button" aria-label="toggle fullscreen" title="fullscreen (f)">⛶</button>
       <button class="modal-close" id="conv-close" type="button" aria-label="close">×</button>
     </div>
     <div class="modal-meta" id="conv-meta"></div>
+    <div class="conv-roles" id="conv-roles" title="show or hide message kinds in this view">
+      <span class="role-label">show</span>
+      <button class="role-chip" data-vrole="user" type="button"><span class="check">■</span>you</button>
+      <button class="role-chip" data-vrole="assistant" type="button"><span class="check">■</span>claude</button>
+      <button class="role-chip" data-vrole="tool" type="button"><span class="check">□</span>tools</button>
+      <button class="role-chip" data-vrole="meta" type="button"><span class="check">□</span>meta</button>
+    </div>
     <div class="modal-body conv-body" id="conv-body"></div>
   </div>
 </div>
@@ -1647,6 +1857,28 @@ let SEARCH_SNIPPETS = {{}};  // session_id -> snippet array (role, before, match
 let SEARCH_SCORES = {{}};    // session_id -> int (2 = phrase hit, 1 = word matches)
 let SEARCH_REQ_ID = 0;
 let SEARCH_REGEX_MODE = new URLSearchParams(window.location.search).get("regex") === "1" || localStorage.getItem("sessions-regex") === "1";
+const ALL_ROLES = ["user", "assistant", "tool", "meta"];
+const DEFAULT_ROLES = "user,assistant";
+// Which message kinds the server full-text search looks inside. URL ?roles=
+// wins (shareable links), else the saved preference, else the default of just
+// the human conversation so git log / bash output never pollutes results.
+let ROLE_FILTER = (function () {{
+  const fromUrl = new URLSearchParams(window.location.search).get("roles");
+  const raw = fromUrl !== null ? fromUrl : (localStorage.getItem("sessions-roles") ?? DEFAULT_ROLES);
+  return new Set(raw.split(",").map(s => s.trim()).filter(r => ALL_ROLES.includes(r)));
+}})();
+function rolesParam() {{ return ALL_ROLES.filter(r => ROLE_FILTER.has(r)).join(","); }}
+// Which message kinds the conversation viewer SHOWS — separate from the search
+// scope above. you + Claude by default; tools/meta are toggled on demand (tool
+// blocks render collapsed, so turning tools on stays low-noise).
+let VIEW_ROLES = (function () {{
+  const raw = localStorage.getItem("sessions-view-roles") ?? DEFAULT_ROLES;
+  return new Set(raw.split(",").map(s => s.trim()).filter(r => ALL_ROLES.includes(r)));
+}})();
+function applyConvViewRoles() {{
+  const body = document.getElementById("conv-body");
+  if (body) ALL_ROLES.forEach(r => body.classList.toggle("show-" + r, VIEW_ROLES.has(r)));
+}}
 
 function rebuildData() {{
   DATA = [...ROWS.values()].sort((a, b) => b.mtime - a.mtime);
@@ -2006,7 +2238,9 @@ function render() {{
   tbody.querySelectorAll(".snippets").forEach(cell => {{
     cell.addEventListener("click", (e) => {{
       e.stopPropagation();
-      openSnippetModal(cell.dataset.sid);
+      // open the full session viewer (not the 3-snippet preview) and jump to
+      // the first hit — the preview snippets are list-only.
+      openConvModal(cell.dataset.sid);
     }});
   }});
   tbody.querySelectorAll(".prompt-clickable").forEach(cell => {{
@@ -2047,6 +2281,57 @@ function highlightText(text, re) {{
   }}
   out += escapeHtml(text.slice(last));
   return out;
+}}
+
+// Highlight query hits inside an already-rendered subtree (markdown + code)
+// without corrupting tags: walk text nodes only and wrap matches in <mark>.
+// Returns the first <mark> created so the caller can scroll it into view.
+function highlightHitsIn(root, re) {{
+  if (!re) return null;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {{
+    acceptNode(n) {{
+      if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+      if (n.parentNode && n.parentNode.nodeName === "MARK") return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    }}
+  }});
+  const targets = [];
+  let n;
+  while ((n = walker.nextNode())) {{
+    re.lastIndex = 0;
+    if (re.test(n.nodeValue)) targets.push(n);
+  }}
+  let first = null;
+  for (const node of targets) {{
+    re.lastIndex = 0;
+    const text = node.nodeValue;
+    const frag = document.createDocumentFragment();
+    let last = 0, m;
+    while ((m = re.exec(text)) !== null) {{
+      if (m.index === re.lastIndex) {{ re.lastIndex++; continue; }}
+      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const mk = document.createElement("mark");
+      mk.textContent = m[0];
+      frag.appendChild(mk);
+      if (!first) first = mk;
+      last = m.index + m[0].length;
+    }}
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+    node.parentNode.replaceChild(frag, node);
+  }}
+  return first;
+}}
+
+// Apply search highlighting to a freshly-rendered chunk of the conversation:
+// wrap hits, open any collapsed tool block that contains one. Returns the first
+// hit element (or null).
+function highlightConvChunk(root, re) {{
+  const first = highlightHitsIn(root, re);
+  root.querySelectorAll("details.conv-block-tool mark").forEach(mk => {{
+    const det = mk.closest("details");
+    if (det) det.open = true;
+  }});
+  return first;
 }}
 
 function openSnippetModal(sid) {{
@@ -2140,48 +2425,99 @@ function highlightCodeIn(root) {{
   }});
 }}
 
-function renderConvMessage(m) {{
-  const role = escapeHtml(m.role || "?");
-  const ts = fmtMsgTs(m.ts);
-  const blocks = (m.blocks || []).map(renderConvBlock).join("");
-  return `<div class="conv-msg conv-msg-${{escapeHtml(m.role || "x")}}" data-idx="${{m.idx}}">
-    <div class="conv-msg-meta"><span class="conv-msg-role">${{role}}</span><span class="conv-msg-ts">${{ts}}</span></div>
-    <div class="conv-msg-blocks">${{blocks}}</div>
-  </div>`;
+function renderConvMessages(msgs) {{
+  return msgs.map(m => {{
+    const roleEsc = escapeHtml(m.role || "?");
+    const ts = fmtMsgTs(m.ts);
+    const blocks = (m.blocks || []).map(renderConvBlock).join("");
+    return `<div class="conv-msg" data-role="${{roleEsc}}" data-idx="${{m.idx}}">
+      <div class="conv-msg-meta"><span class="conv-msg-role">${{roleEsc}}</span><span class="conv-msg-ts">${{ts}}</span></div>
+      <div class="conv-msg-blocks">${{blocks}}</div>
+    </div>`;
+  }}).join("");
+}}
+
+// Park on the i-th match: highlight it, open its tool block if collapsed,
+// center it, and update the counter. Clamps to range.
+function gotoHit(i) {{
+  if (!CONV_STATE || !CONV_STATE.hits || !CONV_STATE.hits.length) return;
+  i = Math.max(0, Math.min(CONV_STATE.hits.length - 1, i));
+  CONV_STATE.hits.forEach(h => h.classList.remove("active-hit"));
+  const mk = CONV_STATE.hits[i];
+  const det = mk.closest("details");
+  if (det && !det.open) det.open = true;
+  mk.classList.add("active-hit");
+  mk.scrollIntoView({{ block: "center", behavior: "instant" }});
+  CONV_STATE.hitI = i;
+  document.getElementById("conv-hit-pos").textContent = (i + 1) + " / " + CONV_STATE.hits.length;
+  document.getElementById("conv-hit-prev").disabled = (i <= 0);
+  document.getElementById("conv-hit-next").disabled = (i >= CONV_STATE.hits.length - 1);
+}}
+
+// step by ±1, stopping at the ends (no wrap-around)
+function nextHit(delta) {{
+  if (!CONV_STATE || !CONV_STATE.hits || !CONV_STATE.hits.length) return;
+  gotoHit(CONV_STATE.hitI + delta);  // gotoHit clamps to [0, n-1]
 }}
 
 async function openConvModal(sid) {{
   const row = ROWS.get(sid);
-  const title = (row && row.custom_title) || "(unnamed)";
-  document.getElementById("conv-title").textContent = title;
+  const name = row && row.custom_title;
+  const q = document.getElementById("q").value.trim();
+  // title: the session name if any, else the session id; when opened from a
+  // search, append the query (highlighted) so it's clear what's marked below.
+  let titleHtml = name ? escapeHtml(name)
+                       : `<span class="conv-title-id">${{escapeHtml(shortId(sid))}}</span>`;
+  if (q) {{
+    titleHtml += `<span class="conv-title-sep">·</span>`
+      + `<span class="conv-title-q"><span class="conv-title-ico">⌕</span>${{highlightText(q, buildHighlightRegex())}}</span>`;
+  }}
+  document.getElementById("conv-title").innerHTML = titleHtml;
   const cwd = row && row.cwd ? prettyPath(row.cwd) : "(unknown)";
   const meta = document.getElementById("conv-meta");
   meta.innerHTML = `<span>${{escapeHtml(cwd)}}</span><span class="sep">·</span><span>${{escapeHtml(shortId(sid))}}</span><span class="sep">·</span><span id="conv-pos">loading…</span>`;
   const body = document.getElementById("conv-body");
   body.innerHTML = "";
-  CONV_STATE = {{ sid, sliceStart: null, loading: false, exhausted: false }};
+  const re = buildHighlightRegex();
+  CONV_STATE = {{ sid, sliceStart: null, loading: false, exhausted: false, re, hits: [], hitI: -1 }};
   document.getElementById("conv-backdrop").style.display = "flex";
   applyModalFullscreen("conv-backdrop");
-  // first page: end omitted → server returns the latest CONV_BATCH
-  const d = await fetchConv(sid, null);
+  // When searching, load the whole session in one shot so every match is in the
+  // DOM and prev/next can reach all of them. Otherwise page in newest-first.
+  const d = await fetchConv(sid, null, re ? 1000000 : CONV_BATCH);
   if (!d || CONV_STATE === null || CONV_STATE.sid !== sid) return;
-  body.innerHTML = d.messages.map(renderConvMessage).join("") || `<div class="conv-empty">(no readable messages)</div>`;
+  body.innerHTML = renderConvMessages(d.messages) || `<div class="conv-empty">(no readable messages)</div>`;
+  applyConvViewRoles();
   highlightCodeIn(body);
-  // expand any tool block that contains a highlighted hit on demand — keep
-  // collapsed by default so this is opt-in.
+  // Highlight + collect matches only inside the message kinds the search
+  // covered (ROLE_FILTER), so the nav count matches the result list. Tool
+  // output stays visible, it's just not part of the match walk.
+  const roleSel = [...ROLE_FILTER].map(r => ".conv-msg[data-role='" + r + "']").join(",");
+  if (re && roleSel) {{
+    body.querySelectorAll(roleSel).forEach(sc => highlightConvChunk(sc, re));
+  }}
   CONV_STATE.sliceStart = d.slice_start;
   CONV_STATE.exhausted = (d.slice_start === 0);
   document.getElementById("conv-pos").textContent = `${{d.slice_start}}–${{d.slice_end}} of ${{d.total}}`;
-  // pin to bottom so user sees newest first
-  requestAnimationFrame(() => {{ body.scrollTop = body.scrollHeight; }});
+  const navEl = document.getElementById("conv-hits");
+  CONV_STATE.hits = [...body.querySelectorAll("mark")];
+  if (CONV_STATE.hits.length) {{
+    // park on the LATEST match (rows + snippets are recency-first, so that's
+    // what the user clicked toward); ‹ › walk to older / newer matches.
+    navEl.style.display = "";
+    requestAnimationFrame(() => gotoHit(CONV_STATE.hits.length - 1));
+  }} else {{
+    navEl.style.display = "none";
+    requestAnimationFrame(() => {{ body.scrollTop = body.scrollHeight; }});
+  }}
   // remove any listener left by a previous open (e.g. user clicks a second
   // session without closing the first) so scroll doesn't double-fire.
   body.removeEventListener("scroll", onConvScroll);
   body.addEventListener("scroll", onConvScroll);
 }}
 
-async function fetchConv(sid, end) {{
-  const params = new URLSearchParams({{ sid, count: String(CONV_BATCH) }});
+async function fetchConv(sid, end, count) {{
+  const params = new URLSearchParams({{ sid, count: String(count || CONV_BATCH) }});
   if (end != null) params.set("end", String(end));
   try {{
     const res = await fetch("/messages?" + params.toString());
@@ -2209,9 +2545,15 @@ async function onConvScroll(e) {{
     CONV_STATE.loading = false;
     return;
   }}
-  const olderHtml = d.messages.map(renderConvMessage).join("");
-  body.insertAdjacentHTML("afterbegin", olderHtml);
-  highlightCodeIn(body);  // hljs is idempotent on already-highlighted blocks
+  // render + highlight the new chunk in a detached node, then prepend it, so
+  // we don't re-walk (and re-wrap) the messages already in the DOM.
+  const tmp = document.createElement("div");
+  tmp.innerHTML = renderConvMessages(d.messages);
+  highlightCodeIn(tmp);
+  highlightConvChunk(tmp, CONV_STATE.re);
+  const frag = document.createDocumentFragment();
+  while (tmp.firstChild) frag.appendChild(tmp.firstChild);
+  body.insertBefore(frag, body.firstChild);
   // preserve viewport: adjust scrollTop by added height
   body.scrollTop = scrollBefore + (body.scrollHeight - heightBefore);
   CONV_STATE.sliceStart = d.slice_start;
@@ -2261,9 +2603,29 @@ document.getElementById("conv-close").addEventListener("click", closeConvModal);
 document.getElementById("conv-backdrop").addEventListener("click", (e) => {{
   if (e.target.id === "conv-backdrop") closeConvModal();
 }});
+document.getElementById("conv-hit-prev").addEventListener("click", (e) => {{ e.stopPropagation(); nextHit(-1); }});
+document.getElementById("conv-hit-next").addEventListener("click", (e) => {{ e.stopPropagation(); nextHit(1); }});
 document.addEventListener("keydown", (e) => {{
-  if (e.key === "Escape" && document.getElementById("conv-backdrop").style.display !== "none") {{
+  if (document.getElementById("conv-backdrop").style.display === "none") {{
+    return;
+  }}
+  if (e.key === "Escape") {{
     closeConvModal();
+    return;
+  }}
+  // step through matches while the viewer is open:
+  //   Enter / →  next      Shift+Enter / ←  prev
+  if (!CONV_STATE || !CONV_STATE.hits || !CONV_STATE.hits.length) return;
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+  if (e.key === "Enter") {{
+    e.preventDefault();
+    nextHit(e.shiftKey ? -1 : 1);
+  }} else if (e.key === "ArrowRight") {{
+    e.preventDefault();
+    nextHit(1);
+  }} else if (e.key === "ArrowLeft") {{
+    e.preventDefault();
+    nextHit(-1);
   }}
 }});
 
@@ -2362,9 +2724,14 @@ function syncSearchUrl(q) {{
     url.searchParams.set("q", q);
     if (SEARCH_REGEX_MODE) url.searchParams.set("regex", "1");
     else url.searchParams.delete("regex");
+    // Only pin roles in the URL when they differ from the default, so ordinary
+    // searches keep a clean ?q= link.
+    if (rolesParam() !== DEFAULT_ROLES) url.searchParams.set("roles", rolesParam());
+    else url.searchParams.delete("roles");
   }} else {{
     url.searchParams.delete("q");
     url.searchParams.delete("regex");
+    url.searchParams.delete("roles");
   }}
   // replaceState so typing doesn't bloat browser history; the URL still
   // becomes shareable / bookmarkable and survives reload.
@@ -2392,7 +2759,7 @@ async function updateSearch() {{
   render();
   document.body.classList.add("searching");
   try {{
-    const url = "/search?q=" + encodeURIComponent(q) + (SEARCH_REGEX_MODE ? "&regex=1" : "");
+    const url = "/search?q=" + encodeURIComponent(q) + (SEARCH_REGEX_MODE ? "&regex=1" : "") + "&roles=" + encodeURIComponent(rolesParam());
     const res = await fetch(url);
     if (reqId !== SEARCH_REQ_ID) return;
     const d = await res.json();
@@ -2430,6 +2797,62 @@ document.getElementById("q").addEventListener("input", () => {{
     sync();
     if (document.getElementById("q").value.trim()) updateSearch();
   }});
+}})();
+
+(function initRoleFilter() {{
+  const wrap = document.getElementById("role-filter");
+  if (!wrap) return;
+  ALL_ROLES.forEach(role => {{
+    const btn = wrap.querySelector('[data-role="' + role + '"]');
+    if (!btn) return;
+    const check = btn.querySelector(".check");
+    function sync() {{
+      const on = ROLE_FILTER.has(role);
+      btn.classList.toggle("active", on);
+      if (check) check.textContent = on ? "■" : "□";
+    }}
+    sync();
+    btn.addEventListener("click", () => {{
+      if (ROLE_FILTER.has(role)) ROLE_FILTER.delete(role); else ROLE_FILTER.add(role);
+      localStorage.setItem("sessions-roles", rolesParam());
+      sync();
+      if (document.getElementById("q").value.trim()) updateSearch();
+    }});
+  }});
+}})();
+
+// viewer's `show` chips — toggle which message kinds are visible in the modal
+(function initConvRoles() {{
+  const wrap = document.getElementById("conv-roles");
+  if (!wrap) return;
+  ALL_ROLES.forEach(role => {{
+    const btn = wrap.querySelector('[data-vrole="' + role + '"]');
+    if (!btn) return;
+    const check = btn.querySelector(".check");
+    function sync() {{
+      const on = VIEW_ROLES.has(role);
+      btn.classList.toggle("active", on);
+      if (check) check.textContent = on ? "■" : "□";
+    }}
+    sync();
+    btn.addEventListener("click", () => {{
+      if (VIEW_ROLES.has(role)) VIEW_ROLES.delete(role); else VIEW_ROLES.add(role);
+      localStorage.setItem("sessions-view-roles", ALL_ROLES.filter(r => VIEW_ROLES.has(r)).join(","));
+      sync();
+      applyConvViewRoles();
+    }});
+  }});
+}})();
+
+// The role-filter row makes the toolbar taller, so pin the sticky table header
+// just below it (and keep it correct across zoom / resize / wrapping).
+(function syncTheadTop() {{
+  const tb = document.querySelector(".toolbar");
+  if (!tb) return;
+  const apply = () => document.documentElement.style.setProperty("--thead-top", tb.offsetHeight + "px");
+  apply();
+  if (window.ResizeObserver) new ResizeObserver(apply).observe(tb);
+  window.addEventListener("resize", apply);
 }})();
 
 // Deep-link: if the page loads with ?q=... (e.g. a shared/bookmarked search
@@ -2780,7 +3203,10 @@ def serve(port: int) -> None:
                 end = int(end_str) if end_str else None
             except ValueError:
                 end = None
-            count = max(1, min(count, 200))
+            # Cap as a memory guard. The viewer pages in 30 at a time, but a
+            # search loads the whole session at once (so match nav can reach
+            # every hit), so the ceiling has to cover a full conversation.
+            count = max(1, min(count, 2000))
             result = _session_messages(sid, end, count)
             if result is None:
                 self.send_error(404)
@@ -2789,14 +3215,23 @@ def serve(port: int) -> None:
             self._send_bytes(body, "application/json; charset=utf-8")
 
         def _handle_search(self) -> None:
-            qs = parse_qs(urlparse(self.path).query)
+            # keep_blank_values so roles= (all chips off) is seen as "match
+            # nothing" rather than collapsing to "param absent" -> default.
+            qs = parse_qs(urlparse(self.path).query, keep_blank_values=True)
             q = (qs.get("q") or [""])[0]
             use_regex = (qs.get("regex") or ["0"])[0] in ("1", "true", "yes")
-            sids, snippets, scores, truncated = _search_sessions(q, use_regex=use_regex)
+            # roles absent (old client / deep link) -> default to the conversation
+            # itself (user+assistant). Present but empty -> match nothing.
+            if "roles" in qs:
+                roles = {r for r in qs["roles"][0].split(",") if r}
+            else:
+                roles = {"user", "assistant"}
+            sids, snippets, scores, truncated = _search_sessions(q, use_regex=use_regex, roles=roles)
             body = json.dumps(
                 {
                     "q": q,
                     "regex": use_regex,
+                    "roles": sorted(roles),
                     "session_ids": sids,
                     "snippets": snippets,
                     "scores": scores,

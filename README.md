@@ -82,13 +82,15 @@ stream per tab.
 ## UI
 
 - Left sidebar: directory tree (filters to that subtree on click)
-- Toolbar: full-text search (`/`) across session bodies with word-AND fuzzy + `regex` toggle; matches preview the surrounding context with the hit highlighted, `named` filter, `by dir` / `by name` grouping
+- Toolbar: full-text search (`/`) across session bodies with word-AND fuzzy + `regex` toggle; a `search in` row scopes which message kinds are matched (`you` / `claude` / `tools` / `meta`, defaulting to your + Claude's messages so tool and git output don't drown the results). Plus a `named` filter and `by dir` / `by name` grouping.
+- Match rows preview the surrounding context with the hit highlighted. Click one to open the full session viewer: it loads the whole conversation, jumps to the latest match, and highlights every match. Step through them with the `‹ ›` buttons, or **`Enter` / `→`** (next) and **`Shift+Enter` / `←`** (previous). **`f`** toggles fullscreen, **`Esc`** closes.
 - Dark + light themes (auto by OS, manual toggle persists)
 - Each row: `copy` button writes `cd "<cwd>" && claude --resume <name|id>`
   to clipboard
 
-Preferences (`named-only`, `group-mode`, `theme`, tree expansion, selected
-directory) persist in `localStorage`.
+Preferences (`search in` roles, `named-only`, `group-mode`, `theme`, tree
+expansion, selected directory) persist in `localStorage`. A search is also
+shareable: `?q=` (and `?regex=1` / `?roles=`) in the URL reruns it on load.
 
 ## Run as a background daemon (macOS)
 
