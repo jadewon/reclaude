@@ -1464,27 +1464,6 @@ def build_html() -> str:
     flex-direction: column;
     gap: 18px;
   }}
-  .modal-msg {{
-    border-left: 2px solid var(--border-strong);
-    padding: 6px 12px;
-  }}
-  .modal-msg.has-hit {{ border-left-color: var(--accent); }}
-  .modal-msg-role {{
-    font-size: 9px;
-    text-transform: uppercase;
-    letter-spacing: 0.16em;
-    color: var(--muted);
-    margin-bottom: 6px;
-  }}
-  .modal-msg.has-hit .modal-msg-role {{ color: var(--accent); }}
-  .modal-msg-text {{
-    font-size: 12.5px;
-    line-height: 1.65;
-    white-space: pre-wrap;
-    word-break: break-word;
-    color: var(--fg-dim);
-  }}
-
   .conv-body {{ gap: 14px; }}
   .conv-msg {{
     padding: 12px 14px;
@@ -1808,18 +1787,6 @@ def build_html() -> str:
         <span class="empty-search"><span class="empty-spinner" aria-hidden="true"></span>searching all sessions…</span>
       </div>
     </main>
-  </div>
-</div>
-
-<div id="modal-backdrop" class="modal-backdrop" style="display:none">
-  <div class="modal" role="dialog" aria-modal="true">
-    <div class="modal-head">
-      <div class="modal-title" id="modal-title"></div>
-      <button class="modal-expand" data-backdrop="modal-backdrop" type="button" aria-label="toggle fullscreen" title="fullscreen (f)">⛶</button>
-      <button class="modal-close" id="modal-close" type="button" aria-label="close">×</button>
-    </div>
-    <div class="modal-meta" id="modal-meta"></div>
-    <div class="modal-body" id="modal-body"></div>
   </div>
 </div>
 
@@ -2334,50 +2301,6 @@ function highlightConvChunk(root, re) {{
   return first;
 }}
 
-function openSnippetModal(sid) {{
-  const row = ROWS.get(sid);
-  const snips = SEARCH_SNIPPETS[sid] || [];
-  if (!row) return;
-  const re = buildHighlightRegex();
-  const title = row.custom_title || "(unnamed)";
-  document.getElementById("modal-title").textContent = title;
-  const cwd = row.cwd ? prettyPath(row.cwd) : "(unknown)";
-  document.getElementById("modal-meta").innerHTML =
-    `<span>${{escapeHtml(cwd)}}</span><span class="sep">·</span><span>${{escapeHtml(shortId(sid))}}</span><span class="sep">·</span><span>${{snips.length}} match block${{snips.length === 1 ? "" : "s"}}</span>`;
-  const body = document.getElementById("modal-body");
-  if (!snips.length) {{
-    body.innerHTML = `<div class="modal-msg"><div class="modal-msg-text">${{escapeHtml(row.last_prompt || "(no preview available)")}}</div></div>`;
-  }} else {{
-    body.innerHTML = snips.map(s => {{
-      const role = escapeHtml(s.role || "?");
-      const text = s.full || ((s.before || "") + (s.match || "") + (s.after || ""));
-      return `<div class="modal-msg has-hit"><div class="modal-msg-role">${{role}}</div><div class="modal-msg-text">${{highlightText(text, re)}}</div></div>`;
-    }}).join("");
-  }}
-  document.getElementById("modal-backdrop").style.display = "flex";
-  applyModalFullscreen("modal-backdrop");
-  // Scroll the first highlighted hit into view so long messages don't hide it
-  // below the fold. requestAnimationFrame waits for layout after display flip.
-  requestAnimationFrame(() => {{
-    const firstMark = body.querySelector("mark");
-    if (firstMark) firstMark.scrollIntoView({{ block: "center", behavior: "instant" }});
-  }});
-}}
-
-function closeSnippetModal() {{
-  document.getElementById("modal-backdrop").style.display = "none";
-}}
-
-document.getElementById("modal-close").addEventListener("click", closeSnippetModal);
-document.getElementById("modal-backdrop").addEventListener("click", (e) => {{
-  if (e.target.id === "modal-backdrop") closeSnippetModal();
-}});
-document.addEventListener("keydown", (e) => {{
-  if (e.key === "Escape" && document.getElementById("modal-backdrop").style.display !== "none") {{
-    closeSnippetModal();
-  }}
-}});
-
 // ───── conversation modal (full session, reverse-infinite scroll) ─────
 let CONV_STATE = null;  // {{sid, sliceStart, loading, exhausted}}
 const CONV_BATCH = 30;
@@ -2853,17 +2776,6 @@ document.getElementById("q").addEventListener("input", () => {{
   apply();
   if (window.ResizeObserver) new ResizeObserver(apply).observe(tb);
   window.addEventListener("resize", apply);
-}})();
-
-// Deep-link: if the page loads with ?q=... (e.g. a shared/bookmarked search
-// URL written by syncSearchUrl), pre-fill the box and run the search so the
-// URL actually "survives reload" as the comment there claims.
-(function initSearchFromUrl() {{
-  const q = new URLSearchParams(window.location.search).get("q");
-  if (q) {{
-    document.getElementById("q").value = q;
-    updateSearch();
-  }}
 }})();
 
 document.getElementById("all-btn").addEventListener("click", () => {{
