@@ -16,6 +16,16 @@ durable and complete, but not browsable. `reclaude` reads it live and
 surfaces the signal: what did I name this session, which directory was it in,
 what was I doing last?
 
+## Keep the history
+
+Claude Code deletes session files older than `cleanupPeriodDays` at startup —
+**30 days by default**, which quietly caps how far back `reclaude` can look.
+Raise it in `~/.claude/settings.json` before the sessions you'd want are gone:
+
+```json
+{ "cleanupPeriodDays": 3650 }
+```
+
 ## Install
 
 ### Homebrew (macOS, recommended)

@@ -48,11 +48,11 @@ def main() -> None:
         ordered = projects / "proj" / "session-ordered.jsonl"
         scrambled = projects / "proj" / "session-scrambled.jsonl"
         split = projects / "proj" / "session-split.jsonl"
-        make_jsonl(ordered, [("user", "메일 제목: 숙소 상태 정보 검토 안내 입니다")])
-        make_jsonl(scrambled, [("user", "안내 검토 정보 상태 숙소 순서가 뒤바뀐 문장")])
+        make_jsonl(ordered, [("user", "문서 제목: 색인 구조 변경 기록 초안 입니다")])
+        make_jsonl(scrambled, [("user", "초안 기록 변경 구조 색인 순서가 뒤바뀐 문장")])
         # every phrase word is in the file, but spread across two messages —
         # a phrase must land inside ONE message, so this must not match either.
-        make_jsonl(split, [("user", "숙소 상태"), ("assistant", "정보 검토 안내")])
+        make_jsonl(split, [("user", "색인 구조"), ("assistant", "변경 기록 초안")])
 
         def ids(q: str, roles: set[str] | None = None) -> set[str]:
             sids, _snips, _scores, _trunc = reclaude._search_sessions(q, roles=roles)
@@ -64,28 +64,28 @@ def main() -> None:
             print(f"  ok: {q!r} -> {sorted(got)}")
 
         # Unquoted: word-AND, so every file holding all the words matches.
-        expect("숙소 상태 정보 검토 안내", {"session-ordered", "session-scrambled", "session-split"})
+        expect("색인 구조 변경 기록 초안", {"session-ordered", "session-scrambled", "session-split"})
         # Quoted: only the file with the verbatim run.
-        expect('"숙소 상태 정보 검토 안내"', {"session-ordered"})
+        expect('"색인 구조 변경 기록 초안"', {"session-ordered"})
         # Phrase + bare word are ANDed; the bare word may live anywhere in file.
-        expect('"숙소 상태" 입니다', {"session-ordered"})
-        expect('"숙소 상태" 뒤바뀐', set())
+        expect('"색인 구조" 입니다', {"session-ordered"})
+        expect('"색인 구조" 뒤바뀐', set())
         # A phrase that exists nowhere.
-        expect('"상태 숙소 정보"', set())
+        expect('"변경 색인 구조"', set())
         # Role filter still applies to the message the phrase landed in:
-        # "정보 검토 안내" is verbatim in ordered's user line and in split's
+        # "변경 기록 초안" is verbatim in ordered's user line and in split's
         # assistant line, so each role sees only its own file.
-        expect('"정보 검토 안내"', {"session-ordered"}, {"user"})
-        expect('"정보 검토 안내"', {"session-split"}, {"assistant"})
+        expect('"변경 기록 초안"', {"session-ordered"}, {"user"})
+        expect('"변경 기록 초안"', {"session-split"}, {"assistant"})
 
         # A verbatim hit is ranked as a phrase hit (3), above word-AND noise.
-        _sids, _snips, scores, _t = reclaude._search_sessions('"숙소 상태 정보 검토 안내"')
+        _sids, _snips, scores, _t = reclaude._search_sessions('"색인 구조 변경 기록 초안"')
         assert scores.get("session-ordered") == 3, scores
         print("  ok: exact phrase scores 3")
 
         # Snippets point at the phrase, not at some unrelated single word.
-        _sids, snips, _scores, _t = reclaude._search_sessions('"숙소 상태 정보 검토 안내"')
-        assert snips["session-ordered"][0]["match"] == "숙소 상태 정보 검토 안내", snips
+        _sids, snips, _scores, _t = reclaude._search_sessions('"색인 구조 변경 기록 초안"')
+        assert snips["session-ordered"][0]["match"] == "색인 구조 변경 기록 초안", snips
         print("  ok: snippet match is the phrase")
 
         # The bigram index must narrow on the phrase's words, not on the raw
@@ -93,7 +93,7 @@ def main() -> None:
         while reclaude._index_pick_pending():
             p, mtime, size = reclaude._index_pick_pending()
             reclaude._index_file(p, mtime, size)
-        expect('"숙소 상태 정보 검토 안내"', {"session-ordered"})
+        expect('"색인 구조 변경 기록 초안"', {"session-ordered"})
         print("  ok: exact phrase survives a fully-built index")
 
         print("ALL OK")
