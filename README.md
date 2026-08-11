@@ -117,6 +117,7 @@ Read-only. `reclaude` never writes to `~/.claude/`. It only scans for:
 
 - `type: "user"` messages → last prompt
 - `type: "custom-title"` / `type: "agent-name"` → session name
+- `type: "ai-title"` → auto-generated title, shown when there is no session name
 - file mtime → activity time
 - `cwd` field → working directory
 - `~/.claude/sessions/*.json` → active PID detection (green dot)

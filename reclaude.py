@@ -45,6 +45,7 @@ def _scan_file(path: pathlib.Path) -> dict | None:
     session_id = path.stem
     cwd = None
     custom_title = None
+    ai_title = None
     last_prompt = None
     entrypoint = None
     line_count = 0
@@ -66,6 +67,12 @@ def _scan_file(path: pathlib.Path) -> dict | None:
                 custom_title = obj["customTitle"]
             elif t == "agent-name" and obj.get("agentName") and not custom_title:
                 custom_title = obj["agentName"]
+            elif t == "ai-title" and obj.get("aiTitle"):
+                # Auto-generated summary of the session, rewritten as the
+                # conversation goes on — keep the last one. Kept separate from
+                # custom_title because it is NOT a resume key: `claude --resume`
+                # only accepts an explicitly-set name.
+                ai_title = obj["aiTitle"]
             if t == "user" and not obj.get("isSidechain"):
                 msg = obj.get("message") or {}
                 content = msg.get("content")
@@ -87,6 +94,7 @@ def _scan_file(path: pathlib.Path) -> dict | None:
         "session_id": session_id,
         "cwd": cwd,
         "custom_title": custom_title,
+        "ai_title": ai_title,
         "last_prompt": last_prompt,
         "entrypoint": entrypoint,
         "mtime": mtime,
@@ -1248,6 +1256,20 @@ def build_html() -> str:
     text-overflow: ellipsis;
     white-space: nowrap;
   }}
+  /* auto title: same shape, no accent — reads as generated, not authored.
+     It is a sentence rather than a short alias, so allow two lines before
+     ellipsizing; one line cuts most of them off mid-word. */
+  .pill.ai {{
+    background: transparent;
+    color: var(--fg-dim);
+    border-color: var(--border-strong);
+    font-weight: 400;
+    white-space: normal;
+    line-height: 1.35;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }}
   .dash {{
     color: var(--muted-soft);
     font-family: "Fraunces", serif;
@@ -1957,8 +1979,12 @@ function renderCwdPath(cwd) {{
 
 function rowHtml(r, showCwd) {{
   const activeCls = r.active ? "dot active" : "dot";
+  // an explicit name wins; otherwise fall back to Claude Code's auto title
+  // (dimmer pill, since it is a generated label and not a resume key)
   const namePart = r.custom_title
     ? `<span class="pill" title="${{escapeHtml(r.custom_title)}}">${{escapeHtml(r.custom_title)}}</span>`
+    : r.ai_title
+    ? `<span class="pill ai" title="auto title\n${{escapeHtml(r.ai_title)}}">${{escapeHtml(r.ai_title)}}</span>`
     : `<span class="dash">—</span>`;
   const name = `<div class="name-stack">${{namePart}}<span class="sid sid-copy" data-sid="${{escapeHtml(r.session_id)}}" title="click to copy full session id\n${{escapeHtml(r.session_id)}}">${{shortId(r.session_id)}}</span></div>`;
   const cwdPretty = r.cwd ? prettyPath(r.cwd) : "";
@@ -2141,7 +2167,7 @@ function render() {{
     const groups = new Map();
     for (const r of matches) {{
       const key = groupByName
-        ? (r.custom_title || "(unnamed)")
+        ? (r.custom_title || r.ai_title || "(unnamed)")
         : (r.cwd || "(unknown)");
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(r);
@@ -2385,7 +2411,7 @@ function nextHit(delta) {{
 
 async function openConvModal(sid) {{
   const row = ROWS.get(sid);
-  const name = row && row.custom_title;
+  const name = row && (row.custom_title || row.ai_title);
   const q = document.getElementById("q").value.trim();
   // title: the session name if any, else the session id; when opened from a
   // search, append the query (highlighted) so it's clear what's marked below.
@@ -2627,7 +2653,7 @@ function localSearchIds(q) {{
     let re;
     try {{ re = new RegExp(q, "i"); }} catch (e) {{ return out; }}
     for (const r of DATA) {{
-      const hay = [r.custom_title, r.cwd, r.session_id, r.last_prompt].filter(Boolean).join(" ");
+      const hay = [r.custom_title, r.ai_title, r.cwd, r.session_id, r.last_prompt].filter(Boolean).join(" ");
       if (re.test(hay)) out.add(r.session_id);
     }}
     return out;
@@ -2635,7 +2661,7 @@ function localSearchIds(q) {{
   const words = q.toLowerCase().split(/\\s+/).filter(Boolean);
   if (!words.length) return out;
   for (const r of DATA) {{
-    const hay = [r.custom_title, r.cwd, r.session_id, r.last_prompt].filter(Boolean).join(" ").toLowerCase();
+    const hay = [r.custom_title, r.ai_title, r.cwd, r.session_id, r.last_prompt].filter(Boolean).join(" ").toLowerCase();
     if (words.every(w => hay.includes(w))) out.add(r.session_id);
   }}
   return out;
