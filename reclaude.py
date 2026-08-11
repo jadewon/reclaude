@@ -73,6 +73,11 @@ def _scan_file(path: pathlib.Path) -> dict | None:
                 # custom_title because it is NOT a resume key: `claude --resume`
                 # only accepts an explicitly-set name.
                 ai_title = obj["aiTitle"]
+            # The last human prompt is derived by scanning, not read off the
+            # `last-prompt` line that also lives in the jsonl: despite the
+            # name, its `leafUuid` points at whatever line is currently the
+            # conversation leaf (usually a tool_result or attachment), not at
+            # the last thing the human typed.
             if t == "user" and not obj.get("isSidechain"):
                 msg = obj.get("message") or {}
                 content = msg.get("content")

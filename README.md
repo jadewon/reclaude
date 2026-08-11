@@ -100,13 +100,19 @@ Copy the example plist, edit the path to match your clone, load it:
 cp examples/com.github.jadewon.reclaude.plist ~/Library/LaunchAgents/
 # edit paths inside the plist if your clone isn't at ~/.reclaude
 
-launchctl load ~/Library/LaunchAgents/com.github.jadewon.reclaude.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.github.jadewon.reclaude.plist
 ```
 
-Unload:
+Restart after editing the code:
 
 ```sh
-launchctl unload ~/Library/LaunchAgents/com.github.jadewon.reclaude.plist
+launchctl kickstart -k gui/$(id -u)/com.github.jadewon.reclaude
+```
+
+Stop:
+
+```sh
+launchctl bootout gui/$(id -u)/com.github.jadewon.reclaude
 ```
 
 Logs: `/tmp/reclaude.log`, `/tmp/reclaude.err`.
