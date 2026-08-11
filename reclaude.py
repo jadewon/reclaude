@@ -70,8 +70,8 @@ def _scan_file(path: pathlib.Path) -> dict | None:
             elif t == "ai-title" and obj.get("aiTitle"):
                 # Auto-generated summary of the session, rewritten as the
                 # conversation goes on — keep the last one. Kept separate from
-                # custom_title because it is NOT a resume key: `claude --resume`
-                # only accepts an explicitly-set name.
+                # custom_title so the UI can mark it as a label Claude Code
+                # wrote rather than a name the user chose.
                 ai_title = obj["aiTitle"]
             # The last human prompt is derived by scanning, not read off the
             # `last-prompt` line that also lives in the jsonl: despite the
@@ -246,7 +246,8 @@ def _make_snippet(raw_line: bytes, fallback_word: str, regex_pat, phrase_pat, ob
     """Parse one jsonl line and return a snippet dict around the best hit.
 
     Match-finding priority:
-      1. phrase_pat (multi-word query joined with optional [-_\\s]* separators)
+      1. phrase_pat — the query's `"quoted"` phrases verbatim when it has any,
+         else a multi-word query joined with optional [-_\\s]* separators
       2. regex_pat (when in regex mode)
       3. fallback_word (a single literal word from word-AND mode)
 
@@ -436,6 +437,32 @@ def _index_pick_pending() -> tuple[pathlib.Path, float, int] | None:
     return None
 
 
+_QUERY_TOKEN = re.compile(r'"([^"]*)"|(\S+)')
+
+
+def _parse_query(query: str) -> tuple[list[str], list[str]]:
+    """Split a query into (exact phrases, plain words), all lowercased.
+
+    Double quotes mark an exact phrase: `"a b c"` has to appear verbatim in
+    one message's text, while a bare word only has to appear somewhere in the
+    file. An unclosed quote is treated as closed at end of input, so results
+    keep narrowing while the phrase is still being typed.
+    """
+    q = query.lower()
+    if q.count('"') % 2:
+        q += '"'
+    phrases: list[str] = []
+    words: list[str] = []
+    for m in _QUERY_TOKEN.finditer(q):
+        if m.group(1) is not None:
+            phrase = " ".join(m.group(1).split())
+            if phrase:
+                phrases.append(phrase)
+        elif m.group(2):
+            words.append(m.group(2))
+    return phrases, words
+
+
 def _index_lookup(query: str) -> set[str] | None:
     """Return candidate jsonl paths for `query`, or None if index can't filter.
 
@@ -455,7 +482,11 @@ def _index_lookup(query: str) -> set[str] | None:
     """
     if not query:
         return None
-    words = [w for w in query.lower().split() if w]
+    # A quoted phrase narrows candidates by its individual words: every word of
+    # the phrase must be in the file for the phrase to be, and the exact-order
+    # check happens later in the verification scan.
+    phrases, plain = _parse_query(query)
+    words = plain + [w for p in phrases for w in p.split()]
     if not words:
         return None
     conn = _index_conn()
@@ -518,7 +549,8 @@ def _search_sessions(
 
     Word-AND mode (default): split query by whitespace; a session matches when
     every word appears somewhere in the file. Snippets are taken from any line
-    where one of the words hit.
+    where one of the words hit. A `"quoted run"` is instead an exact phrase:
+    it must appear verbatim in a single message, and mixing the two ANDs them.
 
     Regex mode: query is compiled as a single case-insensitive regex; a session
     matches when at least one line matches.
@@ -535,6 +567,7 @@ def _search_sessions(
     phrase_pat = None
     phrase_pat_bytes = None
     word_strs: list[str] = []
+    exact_phrases: list[str] = []
     if use_regex:
         try:
             pat = re.compile(query, re.IGNORECASE)
@@ -542,15 +575,28 @@ def _search_sessions(
         except re.error:
             return [], {}, {}, False
     else:
-        word_strs = [w for w in query.lower().split() if w]
-        if not word_strs:
+        exact_phrases, word_strs = _parse_query(query)
+        if not exact_phrases and not word_strs:
             return [], {}, {}, False
-        if len(word_strs) >= 2:
+        if exact_phrases:
+            # A quoted phrase is a hard filter, not just a ranking boost: it has
+            # to appear verbatim in one message's text. Matching runs against the
+            # parsed + whitespace-normalised text (not raw bytes) so an escaped
+            # newline inside the jsonl doesn't break an otherwise exact hit.
+            phrase_pat = re.compile(
+                "|".join(re.escape(p) for p in exact_phrases), re.IGNORECASE
+            )
+        elif len(word_strs) >= 2:
             joined = r"[\-_\s]*".join(re.escape(w) for w in word_strs)
             phrase_pat = re.compile(joined, re.IGNORECASE)
             phrase_pat_bytes = re.compile(joined.encode("utf-8"), re.IGNORECASE)
 
     words_bytes = [w.encode("utf-8") for w in word_strs]
+    # Cheap byte prefilter. A quoted phrase can't be checked on the raw line, so
+    # its longest word stands in for it and the real check happens after parsing.
+    probe_bytes = words_bytes + [
+        max(p.split(), key=len).encode("utf-8") for p in exact_phrases
+    ]
     # Per-word word-boundary regex (ASCII boundary only — non-ASCII words like
     # Korean are passed through as None, treating any occurrence as bounded so
     # we don't penalise compound words.
@@ -604,6 +650,7 @@ def _search_sessions(
                 word_cands: list[tuple] = []
                 found: set[bytes] = set()
                 bounded_found: set[bytes] = set()
+                exact_found: set[str] = set()
                 phrase_hit = False
                 for raw_line in f:
                     line_lower = raw_line.lower()
@@ -612,7 +659,7 @@ def _search_sessions(
                     if pat_bytes is not None:
                         if not pat_bytes.search(raw_line):
                             continue
-                    elif not any(wb in line_lower for wb in words_bytes):
+                    elif not any(wb in line_lower for wb in probe_bytes):
                         continue
                     # This line has a raw hit. When a role filter is active, parse
                     # it once and drop the whole line unless it's an allowed role
@@ -643,7 +690,21 @@ def _search_sessions(
                                 if fallback is None:
                                     fallback = w_str
                                 line_matches = True
-                        if phrase_pat_bytes is not None and phrase_pat_bytes.search(line_lower):
+                        if exact_phrases:
+                            if obj is None:
+                                try:
+                                    obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+                                except (json.JSONDecodeError, UnicodeDecodeError):
+                                    obj = None
+                            text = ""
+                            if isinstance(obj, dict):
+                                text = _WS_RUN.sub(" ", _extract_text(obj) or "").lower()
+                            for p in exact_phrases:
+                                if p in text:
+                                    exact_found.add(p)
+                                    is_phrase_line = True
+                                    phrase_hit = True
+                        elif phrase_pat_bytes is not None and phrase_pat_bytes.search(line_lower):
                             is_phrase_line = True
                             phrase_hit = True
                     # Collect match candidates, keeping only the most RECENT few
@@ -664,7 +725,10 @@ def _search_sessions(
         if pat_bytes is not None:
             qualifies = b"__regex__" in found
         else:
-            qualifies = len(found) == len(words_bytes)
+            qualifies = (
+                len(found) == len(words_bytes)
+                and len(exact_found) == len(exact_phrases)
+            )
         if qualifies:
             file_snips: list[dict] = []
             for cand_line, cand_obj, cand_fb in (phrase_cands + word_cands):
@@ -1766,7 +1830,7 @@ def build_html() -> str:
     <div class="toolbar">
       <div class="search-col">
         <div class="search-wrap">
-          <input id="q" type="text" placeholder="search names, paths, ids, full content…" autofocus>
+          <input id="q" type="text" placeholder="search names, paths, ids, full content… (&quot;quoted&quot; = exact phrase)" autofocus>
           <span id="search-spinner" class="search-spinner" aria-hidden="true"></span>
         </div>
         <div class="role-filter" id="role-filter" title="which message types the full-text search looks inside">
@@ -1848,7 +1912,7 @@ let DATA = [];
 let GENERATED_AT = "";
 let SEARCH_RESULT = null;  // null = no active search; Set<session_id> when active
 let SEARCH_SNIPPETS = {{}};  // session_id -> snippet array (role, before, match, after)
-let SEARCH_SCORES = {{}};    // session_id -> int (2 = phrase hit, 1 = word matches)
+let SEARCH_SCORES = {{}};    // session_id -> int (3 = phrase, 2 = word-bounded, 1 = substring)
 let SEARCH_REQ_ID = 0;
 let SEARCH_REGEX_MODE = new URLSearchParams(window.location.search).get("regex") === "1" || localStorage.getItem("sessions-regex") === "1";
 const ALL_ROLES = ["user", "assistant", "tool", "meta"];
@@ -1985,7 +2049,7 @@ function renderCwdPath(cwd) {{
 function rowHtml(r, showCwd) {{
   const activeCls = r.active ? "dot active" : "dot";
   // an explicit name wins; otherwise fall back to Claude Code's auto title
-  // (dimmer pill, since it is a generated label and not a resume key)
+  // (dimmer pill, since it is a generated label rather than a chosen name)
   const namePart = r.custom_title
     ? `<span class="pill" title="${{escapeHtml(r.custom_title)}}">${{escapeHtml(r.custom_title)}}</span>`
     : r.ai_title
@@ -1997,10 +2061,13 @@ function rowHtml(r, showCwd) {{
     ? `<div class="cwd-path" title="${{escapeHtml(cwdPretty)}}">${{renderCwdPath(r.cwd)}}</div>`
     : `<div class="cwd-empty"></div>`;
   const contextCell = renderContextCell(r);
-  const resumeArg = r.custom_title ? `"${{r.custom_title}}"` : r.session_id;
+  // Always the session id: `claude --resume` resumes by ID, and a name — a
+  // /rename'd title or the running session's `name` — is only a search term
+  // for the interactive picker, so copying it yields a command that resumes
+  // nothing.
   const cmd = r.cwd
-    ? `cd "${{r.cwd}}" && claude --resume ${{resumeArg}}`
-    : `claude --resume ${{resumeArg}}`;
+    ? `cd "${{r.cwd}}" && claude --resume ${{r.session_id}}`
+    : `claude --resume ${{r.session_id}}`;
   return `
     <tr>
       <td><div class="cell-name"><span class="${{activeCls}}"></span>${{name}}</div></td>
@@ -2249,20 +2316,40 @@ function render() {{
   }});
 }}
 
+const reEsc = s => s.replace(/[.*+?^${{}}()|[\\]\\\\]/g, "\\\\$&");
+// Rendered text may wrap a phrase's spaces differently than the raw jsonl, so a
+// phrase matches across any whitespace run between its words.
+function phrasePattern(p) {{ return p.split(/\\s+/).map(reEsc).join("\\\\s+"); }}
+
 function buildHighlightRegex() {{
   const q = document.getElementById("q").value.trim();
   if (!q) return null;
   if (SEARCH_REGEX_MODE) {{
     try {{ return new RegExp(q, "gi"); }} catch (e) {{ return null; }}
   }}
-  const words = q.split(/\\s+/).filter(Boolean);
-  if (!words.length) return null;
-  const esc = s => s.replace(/[.*+?^${{}}()|[\\]\\\\]/g, "\\\\$&");
-  // longest words first so phrase patterns win over individual words
+  const {{ phrases, words }} = parseQuery(q);
+  if (!phrases.length && !words.length) return null;
+  // longest first so phrase patterns win over the individual words inside them
   const sortedWords = [...words].sort((a, b) => b.length - a.length);
-  const phrase = words.map(esc).join("[\\\\-_\\\\s]*");
-  const parts = [phrase, ...sortedWords.map(esc)];
+  const parts = [];
+  if (phrases.length) {{
+    parts.push(...phrases.map(phrasePattern));
+  }} else if (words.length > 1) {{
+    parts.push(words.map(reEsc).join("[\\\\-_\\\\s]*"));
+  }}
+  parts.push(...sortedWords.map(reEsc));
   return new RegExp("(" + parts.join("|") + ")", "gi");
+}}
+
+// Matches a <mark> whose whole text is one of the query's quoted phrases, so
+// the modal can land on the phrase rather than on a loose word of the same query.
+function buildPhraseRegex() {{
+  if (SEARCH_REGEX_MODE) return null;
+  const q = document.getElementById("q").value.trim();
+  if (!q) return null;
+  const {{ phrases }} = parseQuery(q);
+  if (!phrases.length) return null;
+  return new RegExp("^(?:" + phrases.map(phrasePattern).join("|") + ")$", "i");
 }}
 
 function highlightText(text, re) {{
@@ -2433,6 +2520,20 @@ async function openConvModal(sid) {{
   const body = document.getElementById("conv-body");
   body.innerHTML = "";
   const re = buildHighlightRegex();
+  // The search walks ROLE_FILTER but the viewer only renders VIEW_ROLES, so a
+  // hit in a role the viewer hides would park the modal on a display:none
+  // match (tool output is the usual victim). Show every role the search
+  // covered; the `show` chips can hide it again afterwards.
+  if (re) {{
+    let opened = false;
+    for (const r of ROLE_FILTER) {{
+      if (!VIEW_ROLES.has(r)) {{ VIEW_ROLES.add(r); opened = true; }}
+    }}
+    if (opened) {{
+      localStorage.setItem("sessions-view-roles", ALL_ROLES.filter(r => VIEW_ROLES.has(r)).join(","));
+      syncConvRoleChips();
+    }}
+  }}
   CONV_STATE = {{ sid, sliceStart: null, loading: false, exhausted: false, re, hits: [], hitI: -1 }};
   document.getElementById("conv-backdrop").style.display = "flex";
   applyModalFullscreen("conv-backdrop");
@@ -2457,9 +2558,19 @@ async function openConvModal(sid) {{
   CONV_STATE.hits = [...body.querySelectorAll("mark")];
   if (CONV_STATE.hits.length) {{
     // park on the LATEST match (rows + snippets are recency-first, so that's
-    // what the user clicked toward); ‹ › walk to older / newer matches.
+    // what the user clicked toward); ‹ › walk to older / newer matches. With a
+    // quoted phrase in the query, the latest match that IS the phrase wins —
+    // landing on a bare word of the same query would look like the quotes
+    // were ignored.
     navEl.style.display = "";
-    requestAnimationFrame(() => gotoHit(CONV_STATE.hits.length - 1));
+    const phraseRe = buildPhraseRegex();
+    let target = CONV_STATE.hits.length - 1;
+    if (phraseRe) {{
+      for (let i = target; i >= 0; i--) {{
+        if (phraseRe.test(CONV_STATE.hits[i].textContent)) {{ target = i; break; }}
+      }}
+    }}
+    requestAnimationFrame(() => gotoHit(target));
   }} else {{
     navEl.style.display = "none";
     requestAnimationFrame(() => {{ body.scrollTop = body.scrollHeight; }});
@@ -2652,6 +2763,26 @@ function syncContextHeader() {{
   el.textContent = SEARCH_RESULT === null ? "last prompt" : "matches";
 }}
 
+// Mirror of the server's _parse_query: a `"quoted run"` is an exact phrase that
+// must appear verbatim, everything else is a plain word. An unclosed quote is
+// treated as closed at end of input so results narrow while it's still typed.
+function parseQuery(q) {{
+  let s = q.toLowerCase();
+  if ((s.match(/"/g) || []).length % 2) s += '"';
+  const phrases = [], words = [];
+  const re = /"([^"]*)"|(\\S+)/g;
+  let m;
+  while ((m = re.exec(s)) !== null) {{
+    if (m[1] !== undefined) {{
+      const p = m[1].trim().replace(/\\s+/g, " ");
+      if (p) phrases.push(p);
+    }} else if (m[2]) {{
+      words.push(m[2]);
+    }}
+  }}
+  return {{ phrases, words }};
+}}
+
 function localSearchIds(q) {{
   const out = new Set();
   if (SEARCH_REGEX_MODE) {{
@@ -2663,11 +2794,11 @@ function localSearchIds(q) {{
     }}
     return out;
   }}
-  const words = q.toLowerCase().split(/\\s+/).filter(Boolean);
-  if (!words.length) return out;
+  const {{ phrases, words }} = parseQuery(q);
+  if (!phrases.length && !words.length) return out;
   for (const r of DATA) {{
     const hay = [r.custom_title, r.ai_title, r.cwd, r.session_id, r.last_prompt].filter(Boolean).join(" ").toLowerCase();
-    if (words.every(w => hay.includes(w))) out.add(r.session_id);
+    if (words.every(w => hay.includes(w)) && phrases.every(p => hay.includes(p))) out.add(r.session_id);
   }}
   return out;
 }}
@@ -2775,10 +2906,13 @@ document.getElementById("q").addEventListener("input", () => {{
   }});
 }})();
 
-// viewer's `show` chips — toggle which message kinds are visible in the modal
+// viewer's `show` chips — toggle which message kinds are visible in the modal.
+// openConvModal can turn a role on by itself, so the chip sync is exported.
+let syncConvRoleChips = () => {{}};
 (function initConvRoles() {{
   const wrap = document.getElementById("conv-roles");
   if (!wrap) return;
+  const syncs = [];
   ALL_ROLES.forEach(role => {{
     const btn = wrap.querySelector('[data-vrole="' + role + '"]');
     if (!btn) return;
@@ -2789,6 +2923,7 @@ document.getElementById("q").addEventListener("input", () => {{
       if (check) check.textContent = on ? "■" : "□";
     }}
     sync();
+    syncs.push(sync);
     btn.addEventListener("click", () => {{
       if (VIEW_ROLES.has(role)) VIEW_ROLES.delete(role); else VIEW_ROLES.add(role);
       localStorage.setItem("sessions-view-roles", ALL_ROLES.filter(r => VIEW_ROLES.has(r)).join(","));
@@ -2796,6 +2931,7 @@ document.getElementById("q").addEventListener("input", () => {{
       applyConvViewRoles();
     }});
   }});
+  syncConvRoleChips = () => syncs.forEach(f => f());
 }})();
 
 // The role-filter row makes the toolbar taller, so pin the sticky table header
