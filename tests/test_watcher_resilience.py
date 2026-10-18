@@ -65,6 +65,29 @@ def main() -> None:
         assert reclaude._scan_file(projects / "nope" / "missing.jsonl") is None
         print("  ok: _scan_file on a missing path returns None")
 
+        # A project dir whose listing fails is skipped; its siblings still list.
+        # Path.glob is patched because newer Pythons swallow a vanished dir
+        # inside glob, so a real rmtree would not exercise the guard.
+        keep = projects / "proj-keep" / "sess-keep.jsonl"
+        make_jsonl(keep, ["synthetic keep"])
+        make_jsonl(projects / "proj-broken" / "sess-broken.jsonl", ["synthetic broken"])
+        orig_glob = pathlib.Path.glob
+
+        def glob_failing_on_broken(self, pattern, *args, **kwargs):
+            if self.name == "proj-broken":
+                raise FileNotFoundError(str(self))
+            return orig_glob(self, pattern, *args, **kwargs)
+
+        pathlib.Path.glob = glob_failing_on_broken
+        try:
+            listed = reclaude._session_files()
+        finally:
+            pathlib.Path.glob = orig_glob
+        assert listed == [keep], f"expected only the healthy dir's file, got {listed}"
+        shutil.rmtree(keep.parent)
+        shutil.rmtree(projects / "proj-broken")
+        print("  ok: _session_files skips a project dir whose listing fails")
+
         # A subscriber makes _is_user_active() False (no focused tab), so the
         # idle-indexing step runs too.
         with reclaude._state_lock:
