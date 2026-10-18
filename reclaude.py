@@ -15,6 +15,7 @@ import re
 import sqlite3
 import threading
 import time
+import traceback
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
@@ -26,9 +27,11 @@ SESSIONS_DIR = HOME / ".claude" / "sessions"
 def _active_sessions() -> dict[str, dict]:
     """pid-keyed files in ~/.claude/sessions/ list currently-running sessions."""
     out: dict[str, dict] = {}
-    if not SESSIONS_DIR.exists():
+    try:
+        entries = list(SESSIONS_DIR.iterdir())
+    except OSError:
         return out
-    for p in SESSIONS_DIR.iterdir():
+    for p in entries:
         if p.suffix != ".json":
             continue
         try:
@@ -41,6 +44,27 @@ def _active_sessions() -> dict[str, dict]:
     return out
 
 
+def _session_files() -> list[pathlib.Path]:
+    """List `PROJECTS/*/*.jsonl`, tolerating project dirs that vanish mid-listing.
+
+    Claude Code removes worktree project dirs while we run. Globbing
+    `*/*.jsonl` in one go lets a single vanished dir abort the whole listing
+    (on Pythons whose glob does not swallow it), so list dir by dir and skip
+    only the one that disappeared.
+    """
+    out: list[pathlib.Path] = []
+    try:
+        project_dirs = list(PROJECTS.iterdir())
+    except OSError:
+        return out
+    for d in project_dirs:
+        try:
+            out.extend(d.glob("*.jsonl"))
+        except OSError:
+            continue
+    return out
+
+
 def _scan_file(path: pathlib.Path) -> dict | None:
     session_id = path.stem
     cwd = None
@@ -49,47 +73,52 @@ def _scan_file(path: pathlib.Path) -> dict | None:
     last_prompt = None
     entrypoint = None
     line_count = 0
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line_count += 1
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            if cwd is None and isinstance(obj.get("cwd"), str):
-                cwd = obj["cwd"]
-            if entrypoint is None and isinstance(obj.get("entrypoint"), str):
-                entrypoint = obj["entrypoint"]
-            t = obj.get("type")
-            if t == "custom-title" and obj.get("customTitle"):
-                custom_title = obj["customTitle"]
-            elif t == "agent-name" and obj.get("agentName") and not custom_title:
-                custom_title = obj["agentName"]
-            elif t == "ai-title" and obj.get("aiTitle"):
-                # Auto-generated summary of the session, rewritten as the
-                # conversation goes on — keep the last one. Kept separate from
-                # custom_title so the UI can mark it as a label Claude Code
-                # wrote rather than a name the user chose.
-                ai_title = obj["aiTitle"]
-            # The last human prompt is derived by scanning, not read off the
-            # `last-prompt` line that also lives in the jsonl: despite the
-            # name, its `leafUuid` points at whatever line is currently the
-            # conversation leaf (usually a tool_result or attachment), not at
-            # the last thing the human typed.
-            if t == "user" and not obj.get("isSidechain"):
-                msg = obj.get("message") or {}
-                content = msg.get("content")
-                if isinstance(content, str) and content.strip() and not content.startswith("<"):
-                    last_prompt = content.strip()
-                elif isinstance(content, list):
-                    for piece in content:
-                        if isinstance(piece, dict) and piece.get("type") == "text":
-                            txt = (piece.get("text") or "").strip()
-                            if txt and not txt.startswith("<"):
-                                last_prompt = txt
-                                break
+    # The file (or its whole project dir, e.g. a removed Claude Code worktree)
+    # can vanish between the caller's glob and this open.
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line_count += 1
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if cwd is None and isinstance(obj.get("cwd"), str):
+                    cwd = obj["cwd"]
+                if entrypoint is None and isinstance(obj.get("entrypoint"), str):
+                    entrypoint = obj["entrypoint"]
+                t = obj.get("type")
+                if t == "custom-title" and obj.get("customTitle"):
+                    custom_title = obj["customTitle"]
+                elif t == "agent-name" and obj.get("agentName") and not custom_title:
+                    custom_title = obj["agentName"]
+                elif t == "ai-title" and obj.get("aiTitle"):
+                    # Auto-generated summary of the session, rewritten as the
+                    # conversation goes on — keep the last one. Kept separate from
+                    # custom_title so the UI can mark it as a label Claude Code
+                    # wrote rather than a name the user chose.
+                    ai_title = obj["aiTitle"]
+                # The last human prompt is derived by scanning, not read off the
+                # `last-prompt` line that also lives in the jsonl: despite the
+                # name, its `leafUuid` points at whatever line is currently the
+                # conversation leaf (usually a tool_result or attachment), not at
+                # the last thing the human typed.
+                if t == "user" and not obj.get("isSidechain"):
+                    msg = obj.get("message") or {}
+                    content = msg.get("content")
+                    if isinstance(content, str) and content.strip() and not content.startswith("<"):
+                        last_prompt = content.strip()
+                    elif isinstance(content, list):
+                        for piece in content:
+                            if isinstance(piece, dict) and piece.get("type") == "text":
+                                txt = (piece.get("text") or "").strip()
+                                if txt and not txt.startswith("<"):
+                                    last_prompt = txt
+                                    break
+    except OSError:
+        return None
     try:
         mtime = path.stat().st_mtime
         size = path.stat().st_size
@@ -416,18 +445,17 @@ def _index_pick_pending() -> tuple[pathlib.Path, float, int] | None:
     )}
     seen: set[str] = set()
     pending: tuple[pathlib.Path, float, int] | None = None
-    if PROJECTS.exists():
-        for p in PROJECTS.glob("*/*.jsonl"):
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            ps = str(p)
-            seen.add(ps)
-            prev = indexed.get(ps)
-            if prev is None or prev[0] != st.st_mtime or prev[1] != st.st_size:
-                if pending is None:
-                    pending = (p, st.st_mtime, st.st_size)
+    for p in _session_files():
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        ps = str(p)
+        seen.add(ps)
+        prev = indexed.get(ps)
+        if prev is None or prev[0] != st.st_mtime or prev[1] != st.st_size:
+            if pending is None:
+                pending = (p, st.st_mtime, st.st_size)
     if pending is not None:
         return pending
     for ps in indexed:
@@ -526,16 +554,15 @@ def _index_lookup(query: str) -> set[str] | None:
         "SELECT path, mtime, size FROM files"
     )}
     unknown: set[str] = set()
-    if PROJECTS.exists():
-        for p in PROJECTS.glob("*/*.jsonl"):
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            ps = str(p)
-            prev = indexed.get(ps)
-            if prev is None or prev[0] != st.st_mtime or prev[1] != st.st_size:
-                unknown.add(ps)
+    for p in _session_files():
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        ps = str(p)
+        prev = indexed.get(ps)
+        if prev is None or prev[0] != st.st_mtime or prev[1] != st.st_size:
+            unknown.add(ps)
     return matched | unknown
 
 
@@ -615,14 +642,14 @@ def _search_sessions(
 
     candidate_paths: list[pathlib.Path]
     if use_regex:
-        candidate_paths = list(PROJECTS.glob("*/*.jsonl"))
+        candidate_paths = _session_files()
     else:
         try:
             cand = _index_lookup(query)
         except sqlite3.Error:
             cand = None
         if cand is None:
-            candidate_paths = list(PROJECTS.glob("*/*.jsonl"))
+            candidate_paths = _session_files()
         else:
             candidate_paths = [pathlib.Path(p) for p in cand]
 
@@ -850,7 +877,10 @@ def _session_messages(sid: str, end: int | None, count: int) -> dict | None:
     """
     if not sid or "/" in sid or ".." in sid:
         return None
-    matches = list(PROJECTS.glob(f"*/{sid}.jsonl"))
+    try:
+        matches = list(PROJECTS.glob(f"*/{sid}.jsonl"))
+    except OSError:
+        return None
     if not matches:
         return None
     path = matches[0]
@@ -3114,7 +3144,7 @@ def _full_scan() -> None:
         _rows_by_id.clear()
         _file_mtime.clear()
         _file_to_session.clear()
-        for jsonl in PROJECTS.glob("*/*.jsonl"):
+        for jsonl in _session_files():
             try:
                 mtime = jsonl.stat().st_mtime
             except OSError:
@@ -3134,14 +3164,11 @@ def _compute_diff() -> tuple[list[dict], list[str]]:
     remove: list[str] = []
 
     current: dict[str, float] = {}
-    try:
-        for p in PROJECTS.glob("*/*.jsonl"):
-            try:
-                current[str(p)] = p.stat().st_mtime
-            except OSError:
-                pass
-    except OSError:
-        pass
+    for p in _session_files():
+        try:
+            current[str(p)] = p.stat().st_mtime
+        except OSError:
+            pass
 
     with _state_lock:
         prev_mtime = dict(_file_mtime)
@@ -3193,34 +3220,36 @@ def _publish(event: dict) -> None:
 
 
 def _watcher_loop(interval: float = 2.0) -> None:
+    # Each step of a tick is isolated: an uncaught exception would end this
+    # thread for good, silently freezing live updates and the search index
+    # until the daemon restarts. Log it and try again on the next tick.
     while True:
         time.sleep(interval)
-        upsert, remove = _compute_diff()
-        if upsert or remove:
-            msg = f"[{time.strftime('%H:%M:%S')}] delta: +{len(upsert)} -{len(remove)}"
-            print(msg)
-            _publish({
-                "type": "delta",
-                "upsert": upsert,
-                "remove": remove,
-                "generated": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
-            })
+        try:
+            upsert, remove = _compute_diff()
+            if upsert or remove:
+                msg = f"[{time.strftime('%H:%M:%S')}] delta: +{len(upsert)} -{len(remove)}"
+                print(msg)
+                _publish({
+                    "type": "delta",
+                    "upsert": upsert,
+                    "remove": remove,
+                    "generated": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                })
+        except Exception:
+            traceback.print_exc()
         # Idle indexing: skip while a browser tab is visible+focused on the
         # page. mtime delta detection above still runs every tick so live
         # updates never lag.
-        if _is_user_active():
-            continue
         try:
+            if _is_user_active():
+                continue
             pending = _index_pick_pending()
-        except sqlite3.Error as e:
-            print(f"index pick error: {e}")
-            pending = None
-        if pending is not None:
-            p, mt, sz = pending
-            try:
+            if pending is not None:
+                p, mt, sz = pending
                 _index_file(p, mt, sz)
-            except sqlite3.Error as e:
-                print(f"index write error for {p}: {e}")
+        except Exception:
+            traceback.print_exc()
 
 
 def serve(port: int) -> None:
